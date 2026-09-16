@@ -42,10 +42,14 @@ class NeuroCast(nn.Module):
         window: int = 512,
         latents_per_group: int = 8,
         n_cross_layers: int = 1,
+        stim_every: int | None = None,
+        d_stimulus: int = 64,
+        stim_mode: str = "decode",
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
-        cfg = BackboneConfig(rung, window=window)
+        cfg = BackboneConfig(rung, window=window, stim_every=stim_every,
+                             d_stimulus=d_stimulus, stim_mode=stim_mode)
         d = cfg.d_model
         self.cfg = cfg
         self.d_model = d
@@ -84,10 +88,17 @@ class NeuroCast(nn.Module):
         return ar_flatten(self.perceiver(tok, self.quadrant))
 
     def forward(
-        self, x: torch.Tensor, prompt: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        prompt: torch.Tensor | None = None,
+        stimulus: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``(B, C, T)`` -> ``(B, T'*G, d)`` causal representations."""
-        return self.backbone(self.tokens(x), prompt=prompt)
+        return self.backbone(self.tokens(x), prompt=prompt, stimulus=stimulus)
+
+    def sensor_embedding(self) -> torch.Tensor:
+        """``(C, d)`` embedding of the current montage. For nuisance-token rows."""
+        return self.sensor(self._montage_tensors)
 
     def pooled(self, x: torch.Tensor, prompt: torch.Tensor | None = None) -> torch.Tensor:
         """Mean-pooled representation, for frozen probes and FMScope.

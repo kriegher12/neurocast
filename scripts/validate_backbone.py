@@ -167,6 +167,27 @@ def main() -> int:
     ok &= check("NLL of standard-normal draws matches Gaussian entropy",
                 abs(nll - expected) < 0.05, f"{nll:.4f} vs {expected:.4f}")
 
+    # Worst-case bound. Force a maximally overconfident head (every component at
+    # the log_sigma floor of -7) and score a target far from its mean.
+    hot = GaussianMixtureHead(d_model=16, target_dim=4, n_components=5).eval()
+    raw = GaussianMixtureHead(d_model=16, target_dim=4, n_components=5, defend=None).eval()
+    with torch.no_grad():
+        for hd in (hot, raw):
+            hd.proj.weight.zero_()
+            bias = torch.zeros(4, 5, 3)
+            bias[..., 2] = -7.0                      # log_sigma -> sigma = e^-7
+            hd.proj.bias.copy_(bias.reshape(-1))
+        far = torch.full((1, 4), 3.0)
+        nll_raw = float(-raw.log_prob(ctx, far))
+        nll_def = float(-hot.log_prob(ctx, far))
+        bg_nll = float(4 * (0.5 * math.log(2 * math.pi) + 0.5 * 9.0))
+        cap = bg_nll - 4 * math.log(1e-3)
+    print(f"       overconfident head, target 3 SD away: undefended NLL {nll_raw:,.0f}  "
+          f"defended {nll_def:.1f}  (cap {cap:.1f})")
+    ok &= check("defensive mixture bounds a catastrophically overconfident head",
+                nll_def <= cap + 1e-4 and nll_raw > 100 * cap,
+                "an eye blink after a quiet stretch cannot dominate the loss")
+
     print()
     print("=" * 78)
     print("6. Collapse monitor fires on a collapsed representation")

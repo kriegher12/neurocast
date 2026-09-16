@@ -50,7 +50,7 @@ unexplored"**, and that MEG scaling laws are **"not yet done"**.
 | **H1** | At matched data/compute/architecture, forecasting transfers better than masked reconstruction | masking wins or ties on both axes across ≥2 of 3 compute tiers, 3 seeds |
 | **H2** | Forecasting starves the identity shortcut — lower FMScope subject-variance than masked models | forecasting arms leak as much as masked arms |
 | **H3** | The subject is a *prompt*, not a fine-tune: K minutes in-context ≥ fine-tuning on the same K minutes | prompting underperforms LoRA by >3pp BAcc@10 at K ∈ {10,20,40} min |
-| **H4** | The forecaster inverts into a decoder via noisy-channel inference with an LLM prior | see §9, risk R1 — this is the claim most likely to fail |
+| **H4** | The forecaster inverts into a decoder via noisy-channel inference with an LLM prior | see §8b — R1 is measured, and two of the design's three mitigations failed |
 | **H5** | Geometry conditioning transfers MEG→EEG/OPM/iEEG without retraining | — |
 
 Plus one deliverable that is **architecture-independent and survives all five
@@ -92,7 +92,9 @@ anything it might have to audit.
 | `models/neurocast.py` | ✅ working | `scripts/run_bakeoff.py` |
 | `data/synthetic.py` | ✅ working | `scripts/run_bakeoff.py` |
 | `train/loop.py` | ✅ working | `scripts/run_bakeoff.py` |
-| `decode/`, `atlas/`, `viz/` | ⬜ not started | — |
+| `decode/metrics.py` | ✅ working | `scripts/validate_decode.py` |
+| `decode/scorer.py` | ✅ working | `scripts/validate_decode.py` |
+| `atlas/`, `viz/` | ⬜ not started | — |
 
 Every validation script is built to be **falsified first**: each constructs a
 case that *is* leaky and asserts the harness catches it. A guard that never fires
@@ -160,7 +162,11 @@ No data download needed — all three run on synthetic data in under a minute.
 .venv/Scripts/python.exe scripts/validate_adapt.py
 ```
 
-All seven must exit 0 before you trust any downstream number.
+```bash
+.venv/Scripts/python.exe scripts/validate_decode.py
+```
+
+All eight must exit 0 before you trust any downstream number.
 
 ### Then run the bake-off itself
 
@@ -442,7 +448,9 @@ neurocast/
 ├── adapt/              ★ subject-as-prompt
 │   ├── episodes.py       episodic sampler, guard bands, mismatch negatives
 │   └── nuisance.py       1/f + band power + gain: the ablatable identity pathway
-├── decode/               ⬜ noisy-channel beam search + LLM prior
+├── decode/             ★ noisy-channel inversion
+│   ├── metrics.py        BAcc@k, matching PNPL definitions
+│   └── scorer.py         SubspaceDecoder, LM PMI, per-λ signal-blind calibration
 ├── atlas/                ⬜ forecastability estimators
 └── viz/                  ⬜ topographic movie rendering (real vs forecast)
 scripts/                 validation entry points
@@ -507,15 +515,10 @@ cannot reach; pass it via `extra=`.
 control pass at 0.5833 against a 0.5834 threshold. Use ≥500, more for
 publication.
 
-**R1 — the highest-risk item in the whole program.** `log p(X | w)` sums over
-306×100 ≈ 30,600 dimensions while the word-discriminative information is
-plausibly **under 1 bit**. The between-candidate score difference is a tiny
-signal riding on an enormous common-mode term. Mitigation is built in from day
-one, not as a rescue: a discriminatively-trained low-rank likelihood subspace,
-plus CFG-style nuisance cancellation `log p(X|w) − log p(X|∅)` — which at weight
-1 is exactly pointwise mutual information and cancels the subject-specific
-nuisance common to all candidates. If it still fails, the forecaster survives as
-a pretraining objective and Atlas instrument, and decoding goes discriminative.
+**R1 — measured, and it overturned the plan.** See §8b. Short version: of
+the three mitigations the design proposed, CFG subtraction and a label-fitted
+discriminative subspace **both fail**, provably and measurably. What works is a
+subspace learned from *unlabelled* data.
 
 **A zero-initialised density head starves the trunk.** The mixture head was
 initialised fully at zero so it would start as a standard normal — which makes
@@ -596,6 +599,77 @@ real corpus: LibriBrain100's 32 broad subjects have ~40 min each and are likely
 single-session, so H3's session-drift robustness can only be tested on the deep
 subject and on multi-session corpora (Armeni, MOUS). Worth confirming before
 claiming drift robustness.
+
+---
+
+## 8b. Risk R1 — measured, not argued
+
+`log p(X|w)` sums over ~30,600 dimensions (306 channels × 100 samples) while the
+information separating one word from another is plausibly under a bit. The
+design proposed three mitigations. `scripts/validate_decode.py` builds a
+synthetic problem with that shape — 50 words, signal in a randomly rotated 16-dim
+subspace, only **16 labelled trials per word** — and tests each.
+
+| D | oracle | full-D | LDA r=K−1 | LDA r=16 | **true subspace** | **unlabelled subspace** |
+|---|---|---|---|---|---|---|
+| 128 | 0.780 | 0.488 | 0.487 | 0.540 | 0.693 | 0.685 |
+| 512 | 0.810 | 0.360 | 0.363 | 0.377 | 0.733 | 0.578 |
+| 1024 | 0.837 | 0.367 | 0.348 | 0.285 | **0.772** | **0.558** |
+
+BAcc@10, chance 0.200. The real window is 30,600 dims — 30× beyond this table.
+
+**R1 is real.** Full-dimensional likelihood falls 0.488 → 0.367 with the word
+signal held fixed.
+
+**Design mitigation #1 fails — CFG-style subtraction is a no-op.**
+`log p(X|w) − w_cfg·log p(X|∅)` was meant to "cancel subject nuisance from the
+decision". But `log p(X|∅)` is constant across candidates within a trial, so
+subtracting it at any weight leaves every ranking identical. Measured: BAcc@10
+equal to four decimals for `w_cfg` ∈ {0, 0.5, 1, 2, 10}. It is kept only for
+cross-trial use (open-set detection, abstention, calibration).
+
+**Design mitigation #2 fails — a subspace fitted on the labels.** At full rank,
+LDA is *mathematically identical* to full-D scoring (max gap 0.018): isotropic
+nearest-mean already depends on `x` only through the span of the estimated
+class means, which is exactly LDA's subspace. At rank 16 it is *worse* (0.285),
+because the discriminant directions are estimated from the same scarce labels.
+
+**The decisive measurement.** Supply the *true* subspace and estimate class
+means from only 16 labelled trials per word: **0.69–0.77 at every dimension.**
+The labels are sufficient. The entire bottleneck is estimating the subspace, and
+the labels cannot do it.
+
+**What works: a subspace from unlabelled data** — 0.558 vs 0.367 at D=1024, using
+PCA on 32,000 samples whose labels are generated and discarded. But the
+unlabelled data required grows with dimension, and too little is *worse than
+none* (2,000 samples at D=1600 scored below full-D in an earlier run).
+
+**Why this matters for the thesis.** This is the strongest quantitative argument
+in the codebase *for* the forecaster. Generative decoding in raw observation
+space is not viable at realistic sample sizes. Its viability rests entirely on
+a subspace learned from abundant unlabelled data — which is precisely what a
+self-supervised forecaster trained on hours of MEG is for, with a nonlinear
+inductive bias raw-sensor PCA lacks. H4 is therefore not independent of H1: it
+only works if pretraining produces a good representation.
+
+**Two further corrections caught while validating:**
+
+- *LM term.* Raw LM log-probability re-imports corpus frequency and demotes rare
+  words; balanced accuracy punishes that. LM pointwise mutual information
+  `log p(w|h) − log p(w)` lifts BAcc@10 **0.550 → 0.860**, rare-word recall
+  **0.290 → 0.880**. Unlike neural PMI this *is* candidate-dependent, so it
+  genuinely changes rankings.
+- *The λ constraint needed a per-λ ceiling.* The first version held blind input
+  to a constant `max(chance, LM-only)`. At λ=0 there is no LM in the score, so a
+  blind channel scoring **0.938** — flagrant leakage — passed under a 0.87
+  ceiling. The ceiling now comes from blind scores permuted across trials at
+  each λ: it tracks chance at λ=0 and rises toward LM-only as the LM dominates.
+  The leak is caught (0.938 vs 0.250), and 24/26 λ values are rejected for the
+  leaky channel versus 0/26 for the honest one.
+
+The honest headline for any real decoder is `brain_gain` — real vs. blind
+neural input **with the LM held fixed** — not `BAcc − LM-only`, which credits
+the brain for any gain from combining two score sources.
 
 ---
 

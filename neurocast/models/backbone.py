@@ -49,6 +49,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .conditioning import StimulusCrossAttention
+
 __all__ = [
     "RotaryEmbedding",
     "CausalSelfAttention",
@@ -211,6 +213,10 @@ class BackboneConfig:
     """
 
     RUNGS: dict[str, dict[str, int]] = {
+        # REHEARSAL ONLY. Exists so experiments can be exercised end to end on a
+        # CPU. It is not a point on the scaling ladder and no scientific claim may
+        # rest on a result from it.
+        "tiny": {"d_model": 96, "n_layers": 6, "n_heads": 4},
         "6m": {"d_model": 384, "n_layers": 12, "n_heads": 6},
         "25m": {"d_model": 512, "n_layers": 18, "n_heads": 8},
         "90m": {"d_model": 768, "n_layers": 24, "n_heads": 12},
@@ -224,6 +230,12 @@ class BackboneConfig:
         window: int = 512,
         global_every: int = 5,
         prompt_every: int = 6,
+        stim_every: int | None = None,
+        d_stimulus: int = 64,
+        stim_lag_min: int = 0,
+        stim_lag_max: int = 12,
+        stim_mode: str = "decode",
+        n_groups: int = 5,
     ) -> None:
         if rung not in self.RUNGS:
             raise ValueError(f"unknown rung {rung!r}; choose from {list(self.RUNGS)}")
@@ -232,6 +244,12 @@ class BackboneConfig:
         self.window = window
         self.global_every = global_every
         self.prompt_every = prompt_every
+        self.stim_every = stim_every
+        self.d_stimulus = d_stimulus
+        self.stim_lag_min = stim_lag_min
+        self.stim_lag_max = stim_lag_max
+        self.stim_mode = stim_mode
+        self.n_groups = n_groups
 
 
 class Backbone(nn.Module):
@@ -252,6 +270,12 @@ class Backbone(nn.Module):
             if (i + 1) % cfg.prompt_every == 0:
                 self.layers.append(PromptCrossAttention(d, h))
                 self.kinds.append("xattn")
+            elif cfg.stim_every and (i + 1) % cfg.stim_every == 0:
+                self.layers.append(StimulusCrossAttention(
+                    d, cfg.d_stimulus, h, lag_min=cfg.stim_lag_min,
+                    lag_max=cfg.stim_lag_max, n_groups=cfg.n_groups, mode=cfg.stim_mode,
+                ))
+                self.kinds.append("stim")
             elif (i + 1) % cfg.global_every == 0:
                 self.layers.append(CausalSelfAttention(d, h, window=None))
                 self.kinds.append("global")
@@ -273,10 +297,25 @@ class Backbone(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, prompt: torch.Tensor | None = None) -> torch.Tensor:
-        """``(B, N, d)`` -> ``(B, N, d)``, causal in ``N``."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        prompt: torch.Tensor | None = None,
+        stimulus: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``(B, N, d)`` -> ``(B, N, d)``, causal in ``N``.
+
+        ``prompt`` is key/value-only memory; ``stimulus`` is a separate stream
+        read through banded cross-attention. Neither can carry information from
+        a later brain position to an earlier one.
+        """
         for layer, kind in zip(self.layers, self.kinds):
-            x = layer(x, prompt) if kind == "xattn" else layer(x)
+            if kind == "xattn":
+                x = layer(x, prompt)
+            elif kind == "stim":
+                x = layer(x, stimulus)
+            else:
+                x = layer(x)
         return self.norm_out(x)
 
     def n_parameters(self) -> int:

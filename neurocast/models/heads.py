@@ -49,12 +49,25 @@ class GaussianMixtureHead(nn.Module):
     pushes back to canonical space.
     """
 
-    def __init__(self, d_model: int, target_dim: int, n_components: int = 5) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        target_dim: int,
+        n_components: int = 5,
+        *,
+        defend: float | None = 1e-3,
+    ) -> None:
         super().__init__()
         self.target_dim = int(target_dim)
         self.k = int(n_components)
+        self.defend = defend
         self.norm = nn.LayerNorm(d_model)
         self.proj = nn.Linear(d_model, target_dim * self.k * 3)
+        # Defensive background density, per target dimension. Set from training
+        # statistics with set_background(); defaults to a unit Gaussian, which is
+        # the right scale in canonical space. See log_prob for why it exists.
+        self.register_buffer("bg_mean", torch.zeros(target_dim))
+        self.register_buffer("bg_log_std", torch.zeros(target_dim))
         # Start near a standard normal (zero mean, unit scale, uniform weights)
         # so the first steps are well-conditioned.
         #
@@ -102,7 +115,33 @@ class GaussianMixtureHead(nn.Module):
         t = target.unsqueeze(-1)
         z = (t - mu) * torch.exp(-log_sigma)
         comp = -0.5 * z**2 - log_sigma - 0.5 * math.log(2 * math.pi)
-        return torch.logsumexp(log_w + comp, dim=-1).sum(-1)
+        per_dim = torch.logsumexp(log_w + comp, dim=-1)          # (..., target_dim)
+
+        if self.defend is not None:
+            # Hedge each coordinate with a small share of a broad background.
+            #
+            # Found in the Atlas: an input-dependent variance can be catastrophically
+            # overconfident on a single sample. A heteroscedastic model beat its
+            # baseline on the median sample, yet one sample scored 251 nats and the
+            # average gain flipped sign. This head is more exposed still -- the
+            # log_sigma clamp allows sigma down to e^-7 -- and in real MEG the
+            # triggering event is simply an eye blink after a quiet stretch.
+            #
+            # Guarantees: per-coordinate NLL <= background NLL - log(eps), and the
+            # hedge costs at most -log(1 - eps) nats per coordinate. Still a proper
+            # density, so the likelihood stays usable for the Atlas and decoding.
+            bz = (target - self.bg_mean) * torch.exp(-self.bg_log_std)
+            bg = -0.5 * bz**2 - self.bg_log_std - 0.5 * math.log(2 * math.pi)
+            per_dim = torch.logaddexp(
+                per_dim + math.log1p(-self.defend), bg + math.log(self.defend)
+            )
+        return per_dim.sum(-1)
+
+    @torch.no_grad()
+    def set_background(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Fit the defensive background to training-target statistics."""
+        self.bg_mean.copy_(mean.reshape(self.target_dim))
+        self.bg_log_std.copy_(torch.log(std.clamp_min(1e-6)).reshape(self.target_dim))
 
     def forward(self, h: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Negative log-likelihood, mean over positions."""
