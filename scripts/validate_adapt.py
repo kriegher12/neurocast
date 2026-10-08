@@ -193,12 +193,27 @@ def main() -> int:
 
     bumped = desc.perturb(d_exponent=0.3, gain_factor=1.2)
     d_exp = float((bumped.exponent - desc.exponent).mean())
-    d_var = float((bumped.log_variance - desc.log_variance).mean())
-    expected_var = 2 * np.log10(1.2)
     print(f"  exponent shift {d_exp:+.3f} (requested +0.300)")
-    print(f"  log-variance shift {d_var:+.4f} (expected {expected_var:+.4f} for x1.2 gain)")
     ok &= check("exponent perturbation applies exactly", abs(d_exp - 0.3) < 1e-9)
-    ok &= check("gain perturbation applies exactly", abs(d_var - expected_var) < 1e-9)
+
+    # The gain check is INDEPENDENT of perturb()'s own formula: recompute the
+    # descriptors on data that really was scaled by 1.2 and compare. An earlier
+    # version checked perturb() against the same expression it used, and so
+    # missed that it shifted natural-log fields by a log10 amount.
+    x_g = pink(np.random.default_rng(5), 8, n_t, 1.0)
+    base_g = nuisance.compute(x_g, FS)
+    truth = nuisance.compute(1.2 * x_g, FS)
+    model = base_g.perturb(gain_factor=1.2)
+    gaps = {
+        "offset (log10)": np.abs(model.offset - truth.offset).max(),
+        "log_variance (ln)": np.abs(model.log_variance - truth.log_variance).max(),
+        "log_band_power (ln)": np.abs(model.log_band_power - truth.log_band_power).max(),
+        "exponent (unchanged)": np.abs(model.exponent - truth.exponent).max(),
+    }
+    for name, gap in gaps.items():
+        print(f"  x1.2 gain, {name:<22} perturb vs recomputed: max gap {gap:.1e}")
+    ok &= check("gain perturbation matches descriptors recomputed on scaled data",
+                max(gaps.values()) < 1e-8, f"max gap {max(gaps.values()):.1e}")
 
     print()
     print("=" * 78)

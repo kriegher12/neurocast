@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neurocast"
+version = "0.1.0"
+description = "Forecasting the brain as a foundation for decoding it: a stimulus-conditioned, subject-in-context predictive model of M/EEG, with its leakage controls built first."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# The package itself needs only these. The audit, Atlas and reference paths are
+# NumPy-only by design (scipy's compiled extensions are blocked on at least one
+# development machine by an Application Control policy).
+dependencies = [
+    "numpy>=2.0",   # np.trapezoid
+    "torch>=2.1",   # torch.utils.flop_counter.FlopCounterMode
+]
+
+[project.optional-dependencies]
+# Real-data loading: pnpl wraps LibriBrain/MEG-MASC/Armeni/MOUS; mne reads FIF.
+data = ["mne>=1.6", "pnpl>=0.2", "h5py"]
+# Topographic maps and the demo movie.
+viz = ["matplotlib>=3.8", "pillow"]
+
+[tool.setuptools.packages.find]
+include = ["neurocast*"]

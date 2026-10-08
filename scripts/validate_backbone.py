@@ -15,6 +15,10 @@ Also checked:
   * prompt cross-attention starts as a no-op and is KV-only
   * the collapse monitor fires on a collapsed representation
   * all five arms run, produce finite losses, and reach the trunk
+  * NO ARM'S TARGET REACHES ITS OWN INPUT -- checked by perturbing exactly the
+    samples each arm must predict. An earlier training loop failed this for three
+    of the five arms: masked and JEPA never masked their input, and the
+    peripheral arm predicted a projection of its own input token.
 
 Run:  .venv/Scripts/python.exe scripts/validate_backbone.py
 """
@@ -27,16 +31,21 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from neurocast.models.backbone import Backbone, BackboneConfig  # noqa: E402
+from neurocast.models.backbone import Backbone, BackboneConfig, CausalSelfAttention  # noqa: E402
 from neurocast.models.heads import GaussianMixtureHead  # noqa: E402
+from neurocast.models.neurocast import NeuroCast  # noqa: E402
 from neurocast.objectives.arms import (  # noqa: E402
     CollapseMonitor,
+    EMATeacher,
     OBJECTIVES,
     ar_shift,
     block_mask,
     build,
 )
+from neurocast.train.loop import arm_context, group_targets, valid_positions  # noqa: E402
+from validate_tokenizer import eeg_montage, megin_montage  # noqa: E402
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -242,14 +251,112 @@ def main() -> int:
     ok &= check("block mask hits its target fraction",
                 0.30 < frac < 0.55, f"{frac:.3f} masked")
 
+    ok &= target_leakage()
+
     print()
     print("=" * 78)
     if ok:
-        print("BACKBONE VALIDATED: causal, windowed, proper density,")
-        print("all five arms differentiable through a shared trunk.")
+        print("BACKBONE VALIDATED: causal, windowed, proper density, all five arms")
+        print("differentiable through a shared trunk, and no arm sees its own target.")
         return 0
     print("BACKBONE FAILED validation.")
     return 1
+
+
+def target_leakage() -> bool:
+    """Section 8: perturb exactly what each arm predicts; its input must not move."""
+    print()
+    print("=" * 78)
+    print("8. NO ARM'S TARGET REACHES ITS OWN INPUT")
+    print("=" * 78)
+    ok = True
+    torch.manual_seed(0)
+    montage = megin_montage(n_sites=16)
+    quad = torch.from_numpy(montage.quadrants)
+    G, P, n_patch = 5, 16, 6
+    x = torch.randn(2, len(montage), n_patch * P)
+    proj = torch.randn(P, 8) / P**0.5
+
+    # The bidirectional switch must be real, and the default must stay causal.
+    attn_bi = CausalSelfAttention(32, 4, causal=False).eval()
+    xs = torch.randn(1, 10, 32)
+    with torch.no_grad():
+        xs2 = xs.clone()
+        # Random, not constant: the pre-attention LayerNorm erases a uniform shift.
+        xs2[:, 7] += 5.0 * torch.randn(32)
+        back = float((attn_bi(xs) - attn_bi(xs2))[:, :7].abs().max())
+    ok &= check("causal=False really is bidirectional (a later position moves earlier ones)",
+                back > 1e-4, f"{back:.2e}")
+
+    def perturb_cell(z: torch.Tensor, t: int, g: int) -> torch.Tensor:
+        """Add noise to exactly the raw samples behind position (t, g)."""
+        z2 = z.clone()
+        idx = torch.nonzero(quad == g).flatten()
+        z2[:, idx, t * P:(t + 1) * P] += 5.0 * torch.randn(z.shape[0], idx.numel(), P)
+        return z2
+
+    for arm in ("masked", "jepa"):
+        model = NeuroCast(montage, rung="tiny", window=64, causal=False).eval()
+        teacher = EMATeacher(model) if arm == "jepa" else None
+        gen = torch.Generator().manual_seed(3)
+        with torch.no_grad():
+            c1 = arm_context(arm, model, x, proj=proj, teacher=teacher, generator=gen)
+            p = int(torch.nonzero(c1["mask"][0]).flatten()[0])
+            t, g = divmod(p, G)
+            # Same mask for the perturbed input, and for the unmasked contrast.
+            mask = c1["mask"]
+            x2 = perturb_cell(x, t, g)
+            h2 = model(x2, mask=mask)
+            leak = float((c1["h"] - h2).abs().max())
+            unmasked = float((model(x) - model(x2)).abs().max())
+            tgt2 = (group_targets(x2, quad, G, P, proj) if arm == "masked"
+                    else teacher(x2))
+            moved = float((tgt2 - c1["target"])[:, p].abs().max())
+        ok &= check(f"{arm:<7} masked cell (t={t}, g={g}): perturbing its raw samples "
+                    "moves NOTHING the trunk outputs", leak == 0.0, f"max |delta| {leak:.1e}")
+        ok &= check(f"{arm:<7}   ...the same perturbation is visible without the mask",
+                    unmasked > 1e-4, f"{unmasked:.1e}  (the guard is not vacuous)")
+        ok &= check(f"{arm:<7}   ...and it does change that cell's target",
+                    moved > 1e-4, f"{moved:.1e}")
+
+    # Peripheral: h is read at the last brain group, which precedes periph_t.
+    model = NeuroCast(montage, rung="tiny", window=64).eval()
+    t = 3
+    with torch.no_grad():
+        c1 = arm_context("peripheral", model, x, proj=proj)
+        x2 = perturb_cell(x, t, G - 1)
+        c2 = arm_context("peripheral", model, x2, proj=proj)
+        leak = float((c1["h"] - c2["h"])[:, : t + 1].abs().max())
+        moved = float((c1["peripheral_target"] - c2["peripheral_target"])[:, t].abs().max())
+        own = float((model(x) - model(x2))[:, t * G + G - 1].abs().max())
+    ok &= check("peripheral: predictions for patches <= t ignore periph_t",
+                leak == 0.0, f"max |delta| {leak:.1e}")
+    ok &= check("peripheral:   ...while the target at t does change", moved > 1e-4, f"{moved:.1e}")
+    ok &= check("peripheral:   ...and reading h AT the peripheral position would have leaked it",
+                own > 1e-4, f"{own:.1e}  (what the old loop did)")
+
+    # Empty quadrant: an EEG cap has no peripherals.
+    eeg = eeg_montage(16)
+    v = valid_positions(torch.from_numpy(eeg.quadrants), G, 4)
+    ok &= check("empty peripheral quadrant is excluded from observation targets",
+                not bool(v[G - 1::G].any()) and bool(v.reshape(4, G)[:, :4].all()),
+                f"{int(v.sum())}/{v.numel()} positions scored")
+    head = GaussianMixtureHead(16, 6).eval()
+    hh, tt = torch.randn(3, 16), torch.randn(3, 6)
+    dm = torch.tensor([True, True, True, False, False, False])
+    with torch.no_grad():
+        a = head.log_prob(hh, tt, dm)
+        tt2 = tt.clone()
+        tt2[:, 3:] = 1e3
+        b = head.log_prob(hh, tt2, dm)
+    ok &= check("masked target coordinates contribute exactly 0 nats",
+                bool(torch.equal(a, b)), "a constant coordinate cannot be fitted to a delta")
+    try:
+        NeuroCast(montage, rung="tiny").tokens(x, mask=torch.zeros(2, n_patch * G, dtype=torch.bool))
+        ok &= check("a causal model refuses input masking", False)
+    except ValueError:
+        ok &= check("a causal model refuses input masking", True)
+    return ok
 
 
 if __name__ == "__main__":

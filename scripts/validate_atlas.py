@@ -376,6 +376,25 @@ def main() -> int:
 
     print()
     print("=" * 82)
+    print("11. Band-limited Gaussian noise -- compare at the null's mean order")
+    print("=" * 82)
+    # Nothing here is beyond the spectrum. A variance model whose MEAN has fewer
+    # lags than the null loses linear predictability and reports a large deficit
+    # that has nothing to do with structure.
+    h_fir = fir_bandpass(8.0, 13.0, FS, n_taps=129)
+    tr = causal_filter(rng.standard_normal((1, n)), h_fir)[0, 200:]
+    te = causal_filter(rng.standard_normal((1, n)), h_fir)[0, 200:]
+    spec = est.spectral_null(tr, te, 16, MAX_LAGS)
+    low = info_ci(spec, est.heteroscedastic(tr, te, 16, 16, MAX_LAGS))
+    equal = info_ci(spec, est.heteroscedastic(tr, te, 16, MAX_LAGS, MAX_LAGS))
+    print(f"  alpha-band Gaussian, h=64 ms: beyond spectral with a 16-lag mean {low}")
+    print(f"                                beyond spectral at equal order    {equal}")
+    ok &= check("a lower-order mean fabricates a large deficit (the trap is real)", low.hi < -0.1)
+    ok &= check("at equal mean order, nothing beyond the spectrum", abs(equal.mean) < 0.01,
+                f"{equal.mean:+.4f}")
+
+    print()
+    print("=" * 82)
     if ok:
         print("ATLAS VALIDATED: matches analytic forecastability, rejects the filter")
         print("trap, and separates spectral from beyond-spectral structure.")

@@ -101,6 +101,15 @@ def main() -> int:
           f"{basis.log_det_jacobian():.1f}")
     ok &= check("held-out sensors reconstruct from rank-16 targets", r2 > 0.6, f"R^2 {r2:.3f}")
     ok &= check("whitening Jacobian is finite", np.isfinite(basis.log_det_jacobian()))
+    # An EEG cap has no peripheral channels, so group 4 encodes to constant
+    # zeros. Those coordinates must be excluded from the likelihood, or a density
+    # head fits them to a delta and the NLL runs away.
+    eeg_basis = QuadrantBasis(rank=16, patch=patch).fit(
+        corpus.batch(eeg, 8, 32 * patch, rng).x, eeg.quadrants)
+    cm = eeg_basis.component_mask()
+    ok &= check("an empty quadrant has no scored components (EEG cap, no peripherals)",
+                not cm[4].any() and bool(cm[:4].all()),
+                f"{int(cm.sum())}/{cm.size} target coordinates are real")
 
     print()
     print("=" * 80)
