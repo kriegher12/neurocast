@@ -68,8 +68,12 @@ class QuadrantBasis:
             mu = v.mean(axis=0)
             vc = v - mu
             _, sv, vt = np.linalg.svd(vc, full_matrices=False)
-            r = min(self.rank, vt.shape[0])
             var = sv**2 / max(vc.shape[0] - 1, 1)
+            # Never whiten a direction with (numerically) no variance: dividing by
+            # ~0 turns noise into enormous targets. Rank-deficient calibration data
+            # (too few windows, a dead channel) would otherwise do exactly that.
+            usable = int((var > 1e-8 * max(float(var[0]), 1e-30)).sum())
+            r = min(self.rank, vt.shape[0], usable)
             self.means.append(mu)
             self.comps.append(vt[:r])
             self.scales.append(np.sqrt(np.maximum(var[:r], 1e-12)))
@@ -79,6 +83,23 @@ class QuadrantBasis:
     def explained_variance(self) -> list[float]:
         """Fraction of each quadrant's variance the retained components keep."""
         return list(self.evr)
+
+    def component_mask(self) -> np.ndarray:
+        """``(G, rank)`` bool: True where a target coordinate is a real component.
+
+        A quadrant with no channels has no components, and a small quadrant can
+        have fewer than ``rank``. :meth:`encode` zero-fills those coordinates, so
+        they are constants, not observations, and must not enter a likelihood.
+        MEG-only recordings (no EOG/ECG) always hit this for the peripheral group.
+        """
+        m = np.zeros((self.n_groups, self.rank), dtype=bool)
+        for g, comp in enumerate(self.comps):
+            m[g, : comp.shape[0]] = True
+        return m
+
+    def position_mask(self, n_patch: int) -> torch.Tensor:
+        """``(n_patch * G, rank)`` bool component mask laid out in AR order."""
+        return torch.as_tensor(np.tile(self.component_mask(), (n_patch, 1)))
 
     def log_det_jacobian(self) -> float:
         """log|det| of the whitening map, summed over quadrants, per patch.

@@ -12,11 +12,24 @@ Two things it enforces that a normal loop would not:
 * **Collapse monitors abort latent arms.** A JEPA arm that quietly collapses
   becomes a strawman, and then H1 is unfalsifiable in one direction. Collapse is
   made loud and recorded as a result, not hidden.
+
+And three things that keep each arm's target out of its own input -- every one
+of them a leak that an earlier version of this loop had:
+
+* **M and J really mask.** Their trunk is bidirectional and the masked positions
+  are replaced by a mask token before the backbone. Without that, "masked
+  reconstruction" reconstructs a token the trunk has just been shown, and JEPA
+  distils a teacher that saw the identical input.
+* **P reads the brain, predicts the body.** ``h`` is taken at the last brain group
+  of each patch and the target is that patch's peripheral channels, so the
+  prediction is the AR factor ``p(periph_t | brain_t, x_<t)`` -- never a copy.
+* **Empty quadrants are excluded.** A montage with no channels in some quadrant
+  (MEG-only LibriBrain has no peripherals) yields a constant target there; a
+  density head fits that to a delta and its NLL runs away.
 """
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,15 +37,27 @@ import torch
 
 from ..data.synthetic import SyntheticCorpus
 from ..models.neurocast import NeuroCast
-from ..objectives.arms import CollapseMonitor, EMATeacher, build
-from .flops import ComputeLedger, measure_flops
+from ..objectives.arms import OBJECTIVES, CollapseMonitor, EMATeacher, block_mask, build
+from .flops import TIERS, ComputeLedger, measure_flops
 
-__all__ = ["TrainConfig", "TrainResult", "group_targets", "train"]
+__all__ = [
+    "TrainConfig",
+    "TrainResult",
+    "group_targets",
+    "valid_positions",
+    "peripheral_targets",
+    "arm_context",
+    "build_arm",
+    "train",
+    "extract_representations",
+]
 
 #: Arms whose target comes from an EMA teacher rather than the observation.
 _LATENT_ARMS = frozenset({"jepa", "ar_latent"})
 #: Arms whose target lives in observation space.
 _OBSERVATION_ARMS = frozenset({"masked", "ar_lik"})
+#: Arms whose input is masked; their trunk is bidirectional.
+_MASKED_ARMS = frozenset(n for n, cls in OBJECTIVES.items() if not cls.causal)
 
 
 @dataclass
@@ -107,6 +132,92 @@ def group_targets(
     return flat @ proj
 
 
+def valid_positions(quadrant: torch.Tensor, n_groups: int, n_patch: int) -> torch.Tensor:
+    """``(T'*G,)`` bool: True where the position's quadrant has any channels."""
+    present = torch.bincount(quadrant.long(), minlength=n_groups)[:n_groups] > 0
+    return present.repeat(n_patch)
+
+
+def peripheral_targets(
+    x: torch.Tensor, quadrant: torch.Tensor, n_groups: int, patch: int
+) -> torch.Tensor:
+    """``(B, T', n_periph * patch)`` raw peripheral samples of each patch."""
+    idx = torch.nonzero(quadrant == n_groups - 1).flatten()
+    if idx.numel() == 0:
+        raise ValueError(
+            "the peripheral arm needs peripheral channels (EOG/ECG/...), and this "
+            "montage has none -- see 'The peripheral-channel problem' in the README"
+        )
+    b, _, t = x.shape
+    n_patch = t // patch
+    xp = x[:, idx, : n_patch * patch].reshape(b, idx.numel(), n_patch, patch)
+    return xp.permute(0, 2, 1, 3).reshape(b, n_patch, idx.numel() * patch)
+
+
+def build_arm(arm: str, model: NeuroCast, target_dim: int):
+    """Instantiate an arm's objective sized for ``model``."""
+    n_periph = int((model.quadrant == model.n_groups - 1).sum())
+    kwargs = {
+        "masked": dict(d_model=model.d_model, target_dim=target_dim),
+        "ar_lik": dict(d_model=model.d_model, target_dim=target_dim),
+        "jepa": dict(d_model=model.d_model),
+        "ar_latent": dict(d_model=model.d_model),
+        # One output per peripheral sample in the patch.
+        "peripheral": dict(d_model=model.d_model,
+                           n_peripheral=max(n_periph, 1) * model.patch_samples),
+    }[arm]
+    return build(arm, **kwargs)
+
+
+def arm_context(
+    arm: str,
+    model: NeuroCast,
+    x: torch.Tensor,
+    *,
+    proj: torch.Tensor,
+    teacher: EMATeacher | None = None,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor]:
+    """Run the trunk and assemble everything ``arm``'s loss reads.
+
+    Kept separate from the step so ``scripts/validate_backbone.py`` can check,
+    by perturbation, that no arm's target reaches its own input.
+    """
+    b, _, t = x.shape
+    patch, g = model.patch_samples, model.n_groups
+    n_patch = t // patch
+    n_pos = n_patch * g
+    valid = valid_positions(model.quadrant, g, n_patch).to(x.device)
+    valid = valid[None].expand(b, n_pos)
+
+    mask = None
+    if arm in _MASKED_ARMS:
+        mask = block_mask((b, n_pos), block_len=12, target_frac=0.4,
+                          generator=generator, device=x.device)
+        h = model(x, mask=mask)
+    else:
+        h = model(x)
+
+    ctx: dict[str, torch.Tensor] = {"h": h, "valid": valid}
+    if mask is not None:
+        ctx["mask"] = mask
+
+    if arm in _OBSERVATION_ARMS:
+        ctx["target"] = group_targets(x, model.quadrant, g, patch, proj)
+    elif arm in _LATENT_ARMS:
+        if teacher is None:
+            raise ValueError(f"arm {arm!r} needs an EMA teacher")
+        with torch.no_grad():
+            ctx["target"] = teacher(x)          # the teacher always sees everything
+    elif arm == "peripheral":
+        # Last brain group of each patch: has seen brain_t, not periph_t.
+        ctx["h"] = h[:, g - 2 :: g]
+        ctx["peripheral_target"] = peripheral_targets(x, model.quadrant, g, patch)
+    else:
+        raise ValueError(f"unknown arm {arm!r}")
+    return ctx
+
+
 def train(
     cfg: TrainConfig,
     corpus: SyntheticCorpus,
@@ -119,17 +230,9 @@ def train(
     rng = np.random.default_rng(cfg.seed)
     device = torch.device(cfg.device)
 
-    model = NeuroCast(montage, rung=cfg.rung, window=256, device=device).to(device)
-    n_periph = int((model.quadrant == 4).sum())
-
-    head_kwargs = {
-        "masked": dict(d_model=model.d_model, target_dim=cfg.target_dim),
-        "ar_lik": dict(d_model=model.d_model, target_dim=cfg.target_dim),
-        "jepa": dict(d_model=model.d_model),
-        "ar_latent": dict(d_model=model.d_model),
-        "peripheral": dict(d_model=model.d_model, n_peripheral=max(n_periph, 1)),
-    }[cfg.arm]
-    objective = build(cfg.arm, **head_kwargs).to(device)
+    model = NeuroCast(montage, rung=cfg.rung, window=256,
+                      causal=OBJECTIVES[cfg.arm].causal, device=device).to(device)
+    objective = build_arm(cfg.arm, model, cfg.target_dim).to(device)
 
     teacher = EMATeacher(model) if cfg.arm in _LATENT_ARMS else None
     monitor = CollapseMonitor() if cfg.arm in _LATENT_ARMS else None
@@ -148,34 +251,13 @@ def train(
 
     def one_step() -> torch.Tensor:
         x, _ = make_batch()
-        h = model(x)
-        if cfg.arm in _OBSERVATION_ARMS:
-            target = group_targets(x, model.quadrant, model.n_groups,
-                                   model.patch_samples, proj)
-        elif cfg.arm in _LATENT_ARMS:
-            with torch.no_grad():
-                target = teacher(x)
-        else:  # peripheral
-            full = group_targets(x, model.quadrant, model.n_groups,
-                                 model.patch_samples, proj)
-            target = full[..., : max(n_periph, 1)]
-
-        ctx = {"h": h, "target": target, "peripheral_target": target}
-        if cfg.arm == "masked":
-            from ..objectives.arms import block_mask
-
-            ctx["mask"] = block_mask(
-                (h.shape[0], h.shape[1]), block_len=12, target_frac=0.4,
-                device=device,
-            )
+        ctx = arm_context(cfg.arm, model, x, proj=proj, teacher=teacher)
         return objective.loss(ctx)["loss"]
 
     # Measure the true cost of one step, including the EMA teacher.
     opt.zero_grad(set_to_none=True)
     meas = measure_flops(lambda: one_step().backward(), label=cfg.arm)
     opt.zero_grad(set_to_none=True)
-
-    from .flops import TIERS
 
     budget = cfg.budget if cfg.budget is not None else TIERS[cfg.tier]
     ledger = ComputeLedger(cfg.arm, cfg.tier, budget)

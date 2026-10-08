@@ -91,7 +91,12 @@ class GaussianMixtureHead(nn.Module):
         log_sigma = log_sigma.clamp(-7.0, 7.0)
         return F.log_softmax(logit, dim=-1), mu, log_sigma
 
-    def log_prob(self, h: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def log_prob(
+        self,
+        h: torch.Tensor,
+        target: torch.Tensor,
+        dim_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Log-density of ``target`` given context ``h``.
 
         Parameters
@@ -102,6 +107,12 @@ class GaussianMixtureHead(nn.Module):
             :func:`neurocast.objectives.ar_shift`.
         target
             ``(..., target_dim)``.
+        dim_mask
+            Optional bool, broadcastable to ``target``. Coordinates where it is
+            False contribute exactly 0 nats. Use it for coordinates that are not
+            observations at all -- zero padding beyond a quadrant's PCA rank, or a
+            quadrant with no channels. Left in, a constant coordinate is fitted to
+            a delta and the reported likelihood runs away.
 
         Returns
         -------
@@ -135,6 +146,8 @@ class GaussianMixtureHead(nn.Module):
             per_dim = torch.logaddexp(
                 per_dim + math.log1p(-self.defend), bg + math.log(self.defend)
             )
+        if dim_mask is not None:
+            per_dim = per_dim.masked_fill(~dim_mask.expand_as(per_dim), 0.0)
         return per_dim.sum(-1)
 
     @torch.no_grad()

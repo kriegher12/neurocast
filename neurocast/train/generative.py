@@ -10,6 +10,12 @@ per-sensor signal.
 Defensive mixing is fitted from target statistics before training, so a single
 artifact-like sample cannot dominate the loss (see
 :func:`neurocast.atlas.estimators.defensive_mixture` for how that was found).
+
+Only real components are scored. A quadrant with no channels -- the peripheral
+group on any MEG-only or EEG-only montage -- encodes to constant zeros, and a
+density head would fit those to a delta and report a likelihood that runs away.
+:meth:`QuadrantBasis.position_mask` removes them, and the loss is reported in nats
+per *real* component.
 """
 
 from __future__ import annotations
@@ -78,9 +84,14 @@ def train_generative(
     basis.fit(calib, montage.quadrants)
 
     head = GaussianMixtureHead(model.d_model, rank, n_components=4)
-    targets = basis.encode(calib)
-    head.set_background(targets.reshape(-1, rank).mean(0),
-                        targets.reshape(-1, rank).std(0).clamp_min(1e-3))
+    targets = basis.encode(calib).reshape(-1, rank)
+    real = basis.position_mask(n_patch).repeat(calib.shape[0], 1).float()
+    count = real.sum(0).clamp_min(1.0)
+    bg_mean = (targets * real).sum(0) / count
+    bg_std = (((targets - bg_mean) ** 2 * real).sum(0) / (count - 1).clamp_min(1.0)).sqrt()
+    head.set_background(bg_mean, bg_std.clamp_min(1e-3))
+    # Mask for the *target* positions after ar_shift drops position 0.
+    dim_mask = basis.position_mask(n_patch)[1:]
 
     params = list(model.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
@@ -93,7 +104,7 @@ def train_generative(
         x = corpus.batch(montage, batch, n_times, rng, subjects=subjects).x
         xt = torch.as_tensor(x, dtype=torch.float32)
         h, tgt = ar_shift(model(xt), basis.encode(x))
-        loss = -head.log_prob(h, tgt).mean() / rank
+        loss = -head.log_prob(h, tgt, dim_mask).sum() / (batch * dim_mask.sum())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)

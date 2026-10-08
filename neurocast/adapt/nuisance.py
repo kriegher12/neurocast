@@ -208,13 +208,17 @@ class NuisanceDescriptors:
         Shifting the 1/f exponent by +-0.3 or channel gains by +-20% should move
         label accuracy by less than ~2 percentage points if the model is reading
         cognition rather than measurement statistics.
+
+        A gain ``g`` scales power by ``g^2``. Mind the bases: ``offset`` comes from
+        a log10 fit, while ``log_variance`` and ``log_band_power`` are natural
+        logs. ``scripts/validate_adapt.py`` checks the result against descriptors
+        recomputed on gain-scaled data, not against this formula.
         """
-        log_gain = float(np.log10(gain_factor))
         return NuisanceDescriptors(
             exponent=self.exponent + d_exponent,
-            offset=self.offset + 2 * log_gain,
-            log_variance=self.log_variance + 2 * log_gain,
-            log_band_power=self.log_band_power + 2 * log_gain,
+            offset=self.offset + 2 * float(np.log10(gain_factor)),
+            log_variance=self.log_variance + 2 * float(np.log(gain_factor)),
+            log_band_power=self.log_band_power + 2 * float(np.log(gain_factor)),
             bad_mask=self.bad_mask,
             band_names=self.band_names,
         )

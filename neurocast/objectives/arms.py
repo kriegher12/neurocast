@@ -14,6 +14,16 @@ at matched data, compute and architecture is still missing."*
 Each arm reports, at minimum, downstream transfer **and** FMScope
 subject-identity leakage. A results table without the leakage column is not
 reportable under this design -- the whole H2 claim lives in that column.
+
+Context keys an arm may read
+----------------------------
+``h``                  ``(B, N, d)`` trunk output
+``target``             ``(B, N, k)`` observation or EMA-teacher target
+``mask``               ``(B, N)`` positions hidden from the trunk's input (M, J)
+``valid``              ``(B, N)`` positions with a real target; a quadrant with
+                       no channels yields a constant target that a density head
+                       would fit to a delta and "win" on
+``peripheral_target``  ``(B, N_p, k_p)`` for arm P, aligned with ``h`` by the loop
 """
 
 from __future__ import annotations
@@ -192,18 +202,52 @@ class Objective(nn.Module):
 
 
 class MaskedReconstruction(Objective):
+    """Reconstruct the hidden positions -- and, optionally, the visible ones too.
+
+    ``visible_weight`` adds the reconstruction error at *visible* positions. The
+    lost version of this project found the masked arm collapsed on real MEG --
+    its output ignored its input -- because hidden positions are hard enough to
+    predict that the mean is a strong local optimum, and nothing ties the trunk's
+    output to what it is shown. Scoring visible positions (weight 1.0) forces the
+    output to carry the input, and fixed it; lower learning rates and other
+    targets did not. Default 0.0 keeps the plain MEG-XL-style objective.
+    """
+
     name, causal = "masked", False
 
-    def __init__(self, d_model: int, target_dim: int, spectral_alpha: float = 0.0):
+    def __init__(self, d_model: int, target_dim: int, spectral_alpha: float = 0.0,
+                 visible_weight: float = 0.0):
         super().__init__()
         self.head = MaskedReconstructionHead(d_model, target_dim, spectral_alpha)
+        self.visible_weight = float(visible_weight)
 
     def loss(self, ctx):
-        loss = self.head(ctx["h"], ctx["target"], ctx.get("mask"))
-        return {"loss": loss, "recon": loss.detach()}
+        mask, valid = ctx.get("mask"), ctx.get("valid")
+        hidden = mask
+        if mask is not None and valid is not None:
+            hidden = mask & valid
+        elif valid is not None:
+            hidden = valid
+        loss = self.head(ctx["h"], ctx["target"], hidden)
+        out = {"recon": loss.detach()}
+        if self.visible_weight > 0 and mask is not None:
+            shown = ~mask if valid is None else (~mask & valid)
+            vis = self.head(ctx["h"], ctx["target"], shown)
+            out["visible"] = vis.detach()
+            loss = loss + self.visible_weight * vis
+        out["loss"] = loss
+        return out
 
 
 class JEPA(Objective):
+    """Masked latent prediction. Scored on masked positions only.
+
+    The student sees a masked input (the loop replaces those positions with the
+    mask token); the EMA teacher sees the full input. Predicting the teacher at
+    an *unmasked* position would be self-distillation of an identical view,
+    which teaches nothing and invites collapse.
+    """
+
     name, causal = "jepa", False
 
     def __init__(self, d_model: int, d_target: int | None = None, sigreg: float = 0.05):
@@ -212,7 +256,14 @@ class JEPA(Objective):
         self.sigreg = float(sigreg)
 
     def loss(self, ctx):
-        pred = self.head(ctx["h"], ctx["target"])
+        h, target, mask = ctx["h"], ctx["target"], ctx.get("mask")
+        if mask is not None:
+            if not bool(mask.any()):
+                pred = h.sum() * 0.0
+            else:
+                pred = self.head(h[mask], target[mask])
+        else:
+            pred = self.head(h, target)
         out = {"latent": pred.detach()}
         total = pred
         if self.sigreg > 0:
@@ -257,12 +308,25 @@ class ARLikelihood(Objective):
 
     def loss(self, ctx):
         h, target = ar_shift(ctx["h"], ctx["target"])
+        valid = ctx.get("valid")
+        if valid is not None:
+            v = valid[:, 1:]           # validity of the *target* position
+            h, target = h[v], target[v]
         logp = self.head.log_prob(h, target)
         nll = -logp.mean()
         return {"loss": nll, "nll": nll.detach(), "logp_total": logp.sum().detach()}
 
 
 class Peripheral(Objective):
+    """Predict the peripheral channels of patch ``t`` from the brain.
+
+    The loop hands this arm ``h`` taken at the *last brain group* of each patch
+    -- position ``(t, G-2)`` -- which has seen every brain quadrant at ``t`` and
+    everything before ``t``, but not the peripherals at ``t``. That is exactly the
+    AR factor ``p(x_t^periph | x_t^brain, x_<t)``. Reading ``h`` at the peripheral
+    position itself would let the trunk copy its own input.
+    """
+
     name, causal = "peripheral", True
 
     def __init__(self, d_model: int, n_peripheral: int, gradient_reversal: float = 0.0):

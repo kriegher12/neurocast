@@ -7,7 +7,7 @@ Almost every objective comparison in this literature reports compute as ``6ND``
 estimate holds for the architecture actually being trained. For NeuroCast it
 does not, and the gap is not a rounding error:
 
-* The **SensorPerceiver front-end** cross-attends 80 latents over up to ~320
+* The **SensorPerceiver front-end** cross-attends 40 latents over up to ~320
   channels at every timestep. Its cost scales with *channel count*, which does
   not appear in ``6ND`` at all.
 * The **EMA teacher** in arms J and A-lat runs a full extra forward pass every
@@ -117,9 +117,9 @@ def chinchilla_optimal_params(n_positions: int, epochs: int = 4) -> int:
     """Rough compute-optimal parameter count for a corpus of this size.
 
     Uses the ~20 tokens-per-parameter heuristic against *effective* tokens
-    (positions x epochs). For the realistic MEG corpus -- ~600 h at 62.5
-    tokens/s with 5 groups, about 1.35e8 positions -- four epochs gives ~27M
-    parameters.
+    (positions x epochs). For the realistic MEG corpus -- ~600 h at 15.625
+    patches/s x 5 groups = 78.1 positions/s, about 1.69e8 positions -- four
+    epochs gives ~34M parameters.
 
     That is the arithmetic behind the project's refusal to scale: MEG-XL is 20M
     and is state of the art, and a 1B-parameter brain foundation model on

@@ -188,6 +188,13 @@ class NormalizationRegime(str, Enum):
         and absolute power survive. This is the default for likelihood work
         because it keeps the observation space frozen across sessions.
 
+    SESSION_SCALAR
+        Per-session, per-channel median removal, then **one** robust scale per
+        sensor family (all magnetometers share one, all gradiometers another).
+        Removes DC offsets and session-level gain while keeping the relative
+        amplitude *between* channels of a family -- the topography. The lost
+        version of this project used it for its headline LibriBrain results.
+
     SESSION_ROBUST
         Per-session median/MAD standardisation. Removes gain and amplitude
         carriers of subject identity. Use it to measure how much performance
@@ -195,6 +202,7 @@ class NormalizationRegime(str, Enum):
     """
 
     TYPE_CONST = "type-const"
+    SESSION_SCALAR = "session-scalar"
     SESSION_ROBUST = "session-robust"
 
 
@@ -229,6 +237,7 @@ def fit_normalizer(
     regime: NormalizationRegime = NormalizationRegime.TYPE_CONST,
     *,
     clip: float | None = 20.0,
+    ch_types: list[ChannelType] | list[str] | None = None,
 ) -> AffineTransform:
     """Fit the (invertible) normalisation for a session.
 
@@ -246,8 +255,25 @@ def fit_normalizer(
     if regime is NormalizationRegime.TYPE_CONST:
         return AffineTransform.identity(n_ch)
 
+    flat = x.reshape(-1, n_ch, x.shape[-1]).transpose(1, 0, 2).reshape(n_ch, -1)
+
+    if regime is NormalizationRegime.SESSION_SCALAR:
+        if ch_types is None:
+            raise ValueError("session-scalar needs ch_types: one scale per sensor family")
+        types = [ChannelType(t) for t in ch_types]
+        if len(types) != n_ch:
+            raise ValueError(f"{len(types)} channel types for {n_ch} channels")
+        med = np.median(flat, axis=1)
+        centred = flat - med[:, None]
+        scale = np.ones(n_ch)
+        for fam in set(types):
+            idx = np.array([i for i, t in enumerate(types) if t is fam])
+            # One scale for the whole family: the pooled robust SD.
+            s = 1.4826 * float(np.median(np.abs(centred[idx])))
+            scale[idx] = s if s > 1e-12 else 1.0
+        return AffineTransform(scale=1.0 / scale, shift=-med / scale, name="session-scalar")
+
     if regime is NormalizationRegime.SESSION_ROBUST:
-        flat = x.reshape(-1, n_ch, x.shape[-1]).transpose(1, 0, 2).reshape(n_ch, -1)
         med = np.median(flat, axis=1)
         mad = np.median(np.abs(flat - med[:, None]), axis=1)
         sd = 1.4826 * mad

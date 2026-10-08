@@ -354,6 +354,9 @@ def calibrate_lambda(
     null_blind = [neural_blind[rng.permutation(len(y))] for _ in range(n_null)]
 
     lm_only = balanced_accuracy_at_k(np.asarray(lm, float), y, k)
+    # Computed directly, not read off the curve: a caller's lambda grid need not
+    # start at 0.
+    neural_only = balanced_accuracy_at_k(np.asarray(neural, float), y, k)
 
     curve = []
     ceilings = []
@@ -376,7 +379,7 @@ def calibrate_lambda(
     return LambdaCalibration(
         lam=best[0],
         bacc=best[1],
-        neural_only=curve[0][1],
+        neural_only=neural_only,
         lm_only=lm_only,
         signal_blind=best[2],
         blind_ceiling=best[3],

@@ -40,9 +40,11 @@ same-timestep EOG/ECG. Without that ordering, "the model uses eye movement"
 would be built into the factorisation and the artifact-only control would be
 meaningless.
 
-Cost is ``O(T' * M * C)`` -- for 306 channels, 80 latents and 256 patches that is
-~6.3M attention pairs per layer per second of data. Negligible next to the
-backbone.
+Cost is ``O(T' * M * C)`` -- for 306 channels, 40 latents (8 per group) and 256
+patches that is ~3.1M attention pairs per cross layer. Not negligible: because it
+scales with channel count, the front-end is ~62% of a measured training step at
+309 channels (``scripts/validate_flops.py``), which is why the defaults below were
+cut from 16 latents x 2 layers.
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ class SensorPerceiver(nn.Module):
     d_model
         Width of the input channel tokens and the output group tokens.
     latents_per_group
-        Learned queries per quadrant. 16 by default.
+        Learned queries per quadrant. 8 by default.
     n_groups
         Spatial groups. 5 = four anatomical quadrants plus peripherals.
     """

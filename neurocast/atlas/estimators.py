@@ -108,6 +108,23 @@ def _design(row: np.ndarray, t: np.ndarray, lags: int) -> np.ndarray:
     return row[idx]
 
 
+def _ridge(a: np.ndarray, ridge: float) -> np.ndarray:
+    """Ridge penalty that scales with each column, so fits are unit-free.
+
+    An absolute ``ridge * I`` is not: on data in femtotesla it vanishes, on data
+    in tesla it dominates, and the "same" estimator reports different
+    forecastability for the same brain in different units -- an INV-1 violation
+    that ``scripts/validate_eval.py`` caught. Scaling each column's penalty by its
+    mean square makes every estimate equivariant to a per-channel gain; on
+    unit-variance canonical data it is the same ``1e-3`` it always was. The
+    intercept (column 0) is never penalised.
+    """
+    scale = np.mean(a**2, axis=0)
+    reg = np.diag(ridge * np.maximum(scale, 1e-300))
+    reg[0, 0] = 0.0
+    return reg
+
+
 def _gauss_nll(resid: np.ndarray, var: np.ndarray | float) -> np.ndarray:
     var = np.maximum(var, 1e-12)
     return 0.5 * (_LOG2PI + np.log(var) + resid**2 / var)
@@ -152,9 +169,7 @@ def linear(
         mu = tr[c].mean()
         a_tr = np.column_stack([np.ones(len(t_tr)), _design(tr[c] - mu, t_tr, lags)])
         y_tr = tr[c, t_tr + horizon] - mu
-        reg = ridge * np.eye(a_tr.shape[1])
-        reg[0, 0] = 0.0
-        beta = np.linalg.solve(a_tr.T @ a_tr + reg, a_tr.T @ y_tr)
+        beta = np.linalg.solve(a_tr.T @ a_tr + _ridge(a_tr, ridge), a_tr.T @ y_tr)
         var = float(np.mean((y_tr - a_tr @ beta) ** 2))
 
         a_te = np.column_stack([np.ones(len(t_te)), _design(te[c] - mu, t_te, lags)])
@@ -231,6 +246,13 @@ def heteroscedastic(
     one. A process with zero autocorrelation can still be forecastable this way,
     and the spectral null will report nothing.
 
+    To read "beyond the spectrum" off ``spectral_null - heteroscedastic``, give
+    this model the **same** ``lags`` as the null. Its mean is a linear predictor
+    too, and a lower order loses linear predictability that the null keeps: on
+    band-limited Gaussian noise, which has nothing beyond its spectrum, a 16-lag
+    mean against the 64-lag null reads -0.16 to -0.45 nats/sample. Found while
+    re-measuring LibriBrain predictability; pinned in ``validate_atlas.py``.
+
     Input-dependent variance makes this model vulnerable to single catastrophic
     samples, so it is hedged with :func:`defensive_mixture` by default. Pass
     ``defend=None`` only to reproduce the failure. Homoscedastic models
@@ -245,15 +267,11 @@ def heteroscedastic(
         mu = tr[c].mean()
         a_tr = np.column_stack([np.ones(len(t_tr)), _design(tr[c] - mu, t_tr, lags)])
         y_tr = tr[c, t_tr + horizon] - mu
-        reg = ridge * np.eye(a_tr.shape[1])
-        reg[0, 0] = 0.0
-        beta = np.linalg.solve(a_tr.T @ a_tr + reg, a_tr.T @ y_tr)
+        beta = np.linalg.solve(a_tr.T @ a_tr + _ridge(a_tr, ridge), a_tr.T @ y_tr)
         r2 = (y_tr - a_tr @ beta) ** 2
 
         v_tr = np.column_stack([np.ones(len(t_tr)), _design(tr[c] - mu, t_tr, lags) ** 2])
-        regv = ridge * np.eye(v_tr.shape[1])
-        regv[0, 0] = 0.0
-        gamma = np.linalg.solve(v_tr.T @ v_tr + regv, v_tr.T @ r2)
+        gamma = np.linalg.solve(v_tr.T @ v_tr + _ridge(v_tr, ridge), v_tr.T @ r2)
         floor = 0.05 * float(r2.mean())
 
         a_te = np.column_stack([np.ones(len(t_te)), _design(te[c] - mu, t_te, lags)])
@@ -321,9 +339,7 @@ def linear_with_covariate(
             [np.ones(len(t_tr)), _design(tr[c] - mu, t_tr, lags), cov_block(utr, t_tr_u)]
         )
         y_tr = tr[c, t_tr + horizon] - mu
-        reg = ridge * np.eye(a_tr.shape[1])
-        reg[0, 0] = 0.0
-        beta = np.linalg.solve(a_tr.T @ a_tr + reg, a_tr.T @ y_tr)
+        beta = np.linalg.solve(a_tr.T @ a_tr + _ridge(a_tr, ridge), a_tr.T @ y_tr)
         var = float(np.mean((y_tr - a_tr @ beta) ** 2))
 
         a_te = np.column_stack(

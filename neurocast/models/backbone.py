@@ -13,9 +13,9 @@ Repeating 6-layer block, four times for the 90M rung::
 
     [SWA, SWA, SWA, SWA, GLOBAL, XATTN->prompt]
 
-* **SWA** -- causal sliding-window attention, window 512 tokens. At 62.5
-  tokens/s and G=5 groups that is ~1.6 s of context per layer; stacking deepens
-  the effective receptive field multiplicatively.
+* **SWA** -- causal sliding-window attention, window 512 positions. At 15.625
+  patches/s and G=5 groups (78.1 positions/s) that is ~6.6 s of context per
+  layer; stacking deepens the effective receptive field multiplicatively.
 * **GLOBAL** -- full causal attention, one layer per block. The hybrid-attention
   literature finds roughly one global layer per 6-7 local layers is enough
   (MiniMax-01 uses 1 softmax block per 7 linear blocks).
@@ -36,9 +36,19 @@ project is trying to measure. Attention is O(N^2) but its causality is trivially
 testable, and the test in ``scripts/validate_backbone.py`` does test it. Swap in
 ``mamba-ssm`` once the causality harness can be pointed at it.
 
-At the Phase-1 bake-off scale (16 s windows, ~1,600 positions) quadratic
+At the Phase-1 bake-off scale (16 s windows, ~1,250 positions) quadratic
 attention is entirely affordable. The substitution only starts to bite at the
 Phase-2 long-context stage.
+
+Bidirectional mode, for the masked arms only
+--------------------------------------------
+Arms M and J (masked reconstruction, JEPA) are bidirectional by definition --
+MEG-XL's objective reads both sides of a masked block. ``causal=False`` drops the
+future mask for those arms and nothing else. Their masked positions are replaced
+by a learned mask token *before* the backbone (see
+:meth:`neurocast.models.neurocast.NeuroCast.tokens`), so the target never enters
+the input. Every causal arm, and every model whose likelihood is reported, keeps
+the default ``causal=True``.
 """
 
 from __future__ import annotations
@@ -90,9 +100,14 @@ class CausalSelfAttention(nn.Module):
 
     ``window=None`` gives full causal attention. Otherwise position ``i``
     attends to ``[i - window + 1, i]``.
+
+    ``causal=False`` is for the masked arms only: position ``i`` then attends to
+    ``(i - window, i + window)``, or to everything when ``window`` is ``None``.
     """
 
-    def __init__(self, d_model: int, n_heads: int, window: int | None = None) -> None:
+    def __init__(
+        self, d_model: int, n_heads: int, window: int | None = None, *, causal: bool = True
+    ) -> None:
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
@@ -100,6 +115,7 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.window = window
+        self.causal = bool(causal)
         self.norm = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
@@ -109,9 +125,14 @@ class CausalSelfAttention(nn.Module):
         """True where attention is blocked."""
         i = torch.arange(n, device=device)[:, None]
         j = torch.arange(n, device=device)[None, :]
-        blocked = j > i  # strictly future
-        if self.window is not None:
-            blocked = blocked | (j < i - self.window + 1)
+        if self.causal:
+            blocked = j > i  # strictly future
+            if self.window is not None:
+                blocked = blocked | (j < i - self.window + 1)
+        else:
+            blocked = torch.zeros(n, n, dtype=torch.bool, device=device)
+            if self.window is not None:
+                blocked = (i - j).abs() >= self.window
         return blocked
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -206,10 +227,10 @@ class FeedForward(nn.Module):
 class BackboneConfig:
     """Model-size rungs from the token-budget analysis.
 
-    The corpus is ~1.35e8 sequence positions, so Chinchilla-optimal is ~27M
-    parameters at four epochs. MEG-XL is 20M and is SOTA; that is not a
-    coincidence. Rungs exist to *measure* the scaling curve, not because the
-    large end is expected to win.
+    The corpus is ~1.69e8 sequence positions (600 h x 78.1 positions/s), so
+    Chinchilla-optimal is ~34M parameters at four epochs. MEG-XL is 20M and is
+    SOTA; that is not a coincidence. Rungs exist to *measure* the scaling curve,
+    not because the large end is expected to win.
     """
 
     RUNGS: dict[str, dict[str, int]] = {
@@ -236,6 +257,7 @@ class BackboneConfig:
         stim_lag_max: int = 12,
         stim_mode: str = "decode",
         n_groups: int = 5,
+        causal: bool = True,
     ) -> None:
         if rung not in self.RUNGS:
             raise ValueError(f"unknown rung {rung!r}; choose from {list(self.RUNGS)}")
@@ -250,13 +272,15 @@ class BackboneConfig:
         self.stim_lag_max = stim_lag_max
         self.stim_mode = stim_mode
         self.n_groups = n_groups
+        self.causal = causal
 
 
 class Backbone(nn.Module):
     """Causal stack over the flattened AR sequence.
 
     Every sublayer is causal or prompt-directed, so the whole stack is causal.
-    That invariant is tested by perturbation, not assumed.
+    That invariant is tested by perturbation, not assumed. (``cfg.causal=False``
+    lifts it for the masked arms, and only for them.)
     """
 
     def __init__(self, cfg: BackboneConfig) -> None:
@@ -277,10 +301,11 @@ class Backbone(nn.Module):
                 ))
                 self.kinds.append("stim")
             elif (i + 1) % cfg.global_every == 0:
-                self.layers.append(CausalSelfAttention(d, h, window=None))
+                self.layers.append(CausalSelfAttention(d, h, window=None, causal=cfg.causal))
                 self.kinds.append("global")
             else:
-                self.layers.append(CausalSelfAttention(d, h, window=cfg.window))
+                self.layers.append(CausalSelfAttention(d, h, window=cfg.window,
+                                                       causal=cfg.causal))
                 self.kinds.append("swa")
             self.layers.append(FeedForward(d))
             self.kinds.append("ffn")
@@ -326,8 +351,9 @@ class Backbone(nn.Module):
         for k in self.kinds:
             counts[k] = counts.get(k, 0) + 1
         layout = " ".join(f"{k}x{v}" for k, v in counts.items())
+        mode = "" if self.cfg.causal else " BIDIRECTIONAL"
         return (
-            f"Backbone[{self.cfg.rung}] d={self.cfg.d_model} "
+            f"Backbone[{self.cfg.rung}]{mode} d={self.cfg.d_model} "
             f"layers={self.cfg.n_layers} heads={self.cfg.n_heads} "
             f"window={self.cfg.window}\n  {layout}  "
             f"{self.n_parameters():,} params"

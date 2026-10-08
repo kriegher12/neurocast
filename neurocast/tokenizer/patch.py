@@ -11,8 +11,11 @@ stride = P           NON-overlapping, and this is not negotiable: overlapping
                      patches break the autoregressive chain rule, because a
                      "future" token would contain samples already emitted
 groups G = 5         4 anatomical quadrants + peripherals (see descriptor.py)
-token rate 62.5/s    600 h of MEG -> ~1.35e8 sequence positions
+patch rate 15.625/s  x G = 78.1 sequence positions/s; 600 h of MEG -> ~1.69e8
 ===================  =========================================================
+
+(An earlier design note quoted "62.5 tokens/s"; that is 15.625 patches/s x G=4,
+and it understates the sequence length by 20% at G=5.)
 
 The projection is **per sensor family, not per sensor**. Twelve matrices, one
 per :class:`ChannelType`, so a new montage of a known family needs no new
@@ -29,7 +32,9 @@ from ..data.canonical import ChannelType
 __all__ = ["PATCH_SAMPLES", "TOKENS_PER_SECOND", "TypedPatchEmbed"]
 
 PATCH_SAMPLES = 16
-TOKENS_PER_SECOND = 250.0 / PATCH_SAMPLES  # 62.5
+#: Patches per second per channel group (15.625). Multiply by the number of
+#: groups for sequence positions per second.
+TOKENS_PER_SECOND = 250.0 / PATCH_SAMPLES
 
 
 class TypedPatchEmbed(nn.Module):
