@@ -1,0 +1,68 @@
+{
+  "n_strata": 400,
+  "matched_timing": {
+    "gain": 0.08676689110543223,
+    "unmatched_gain": 0.3101595415523728,
+    "surviving": 0.2797492241288375,
+    "p95": 0.5855553162066803,
+    "score": 0.6416303517376469,
+    "verdict": "mostly timing"
+  },
+  "matched_linear": {
+    "gain": 0.011029200718584098,
+    "unmatched_gain": 0.031463823347953224,
+    "surviving": 0.3505359344480799,
+    "p95": 0.5044301615958807,
+    "score": 0.5030488786827046,
+    "verdict": "no word information beyond timing"
+  },
+  "matched_per_person": {
+    "gain": 0.01506281989528091,
+    "unmatched_gain": 0.0253310699592878,
+    "surviving": 0.5946381230437536,
+    "p95": 0.488018763834997,
+    "score": 0.48893069560277935,
+    "verdict": "survives matching"
+  },
+  "matched_mlp": {
+    "gain": 0.009940581881913046,
+    "unmatched_gain": 0.028218783178589557,
+    "surviving": 0.35226826823118534,
+    "p95": 0.5712850091934276,
+    "score": 0.5707502266189465,
+    "verdict": "no word information beyond timing"
+  },
+  "matched_cnn": {
+    "gain": 0.02302271027340952,
+    "unmatched_gain": 0.04806175706778021,
+    "surviving": 0.4790234830770171,
+    "p95": 0.5417825317688605,
+    "score": 0.5537438369771595,
+    "verdict": "survives matching"
+  },
+  "beyond_linear": {
+    "nats": 0.0013262922507482255,
+    "lo": -0.00283841681548902,
+    "hi": 0.005117979910091401
+  },
+  "beyond_per_person": {
+    "nats": -0.001141194251581987,
+    "lo": -0.002778203085083585,
+    "hi": 0.00040165595796939094
+  },
+  "beyond_mlp": {
+    "nats": 0.0012179943376704329,
+    "lo": -0.012735454433540199,
+    "hi": 0.023339869458632544
+  },
+  "beyond_cnn": {
+    "nats": -0.00783087637687586,
+    "lo": -0.02578484807046993,
+    "hi": 0.026512804346733348
+  },
+  "beyond_frequency_only": {
+    "nats": 0.0,
+    "lo": 0.0,
+    "hi": 0.0
+  }
+}
