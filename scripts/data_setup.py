@@ -155,13 +155,17 @@ def run_checks(verbose: bool = True) -> tuple[Report, Path | None]:
 
     gi = (ROOT / ".gitignore").read_text(encoding="utf-8") if (ROOT / ".gitignore").exists() else ""
     ig = (ROOT / ".ignore").read_text(encoding="utf-8") if (ROOT / ".ignore").exists() else ""
-    missing = [p for p in ("data/", ".env") if p not in gi.split()]
-    if missing:
+    # Anchored: an unanchored "data/" also matches the neurocast/data/ package, and
+    # four of its source files (paths, libribrain, megin, megmasc) went uncommitted.
+    missing = [p for p in ("/data/", ".env") if p not in gi.split()]
+    if "data/" in gi.split():
+        r.add("WARN", ".gitignore", "'data/' also ignores the neurocast/data/ source files; use '/data/'")
+    elif missing:
         r.add("WARN", ".gitignore", f"missing {missing}: data or credentials could be committed")
     else:
-        r.add("OK", ".gitignore covers data/ and .env")
-    r.add("OK" if "data/" in ig.split() else "WARN", ".ignore keeps search tools out of data/",
-          "" if "data/" in ig.split() else "code search would crawl the whole corpus")
+        r.add("OK", ".gitignore covers /data/ and .env")
+    r.add("OK" if "/data/" in ig.split() else "WARN", ".ignore keeps search tools out of /data/",
+          "" if "/data/" in ig.split() else "code search would crawl the whole corpus, or skip neurocast/data/")
     return r, root
 
 

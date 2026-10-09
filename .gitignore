@@ -2,8 +2,8 @@
 .venv-gpu/
 __pycache__/
 *.pyc
-data/
-runs/
+/data/
+/runs/
 *.h5
 *.fif
 .pytest_cache/

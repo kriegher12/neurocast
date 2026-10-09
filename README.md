@@ -48,7 +48,7 @@ unexplored"**, and that MEG scaling laws are **"not yet done"**.
 | | Claim | Kill condition |
 |---|---|---|
 | **H1** | At matched data/compute/architecture, forecasting transfers better than masked reconstruction | masking wins or ties on both axes across ≥2 of 3 compute tiers, 3 seeds |
-| **H2** | Forecasting starves the identity shortcut — lower FMScope subject-variance than masked models | forecasting arms leak as much as masked arms |
+| **H2** | Forecasting starves the identity shortcut — lower FMScope subject-variance than masked models | forecasting arms leak as much as masked arms — **met**: forecasting leaks 6–8× *more* after single-listener pre-training (§2.2, LibriBrain) and 8–11× more about *unseen* people after 20-listener pre-training (§2.3, MEG-MASC), 3 seeds each |
 | **H3** | The subject is a *prompt*, not a fine-tune: K minutes in-context ≥ fine-tuning on the same K minutes | prompting underperforms LoRA by >3pp BAcc@10 at K ∈ {10,20,40} min |
 | **H4** | The forecaster inverts into a decoder via noisy-channel inference with an LLM prior | see §13 — R1 is measured, and two of the design's three mitigations failed |
 | **H5** | Geometry conditioning transfers MEG→EEG/OPM/iEEG without retraining | training from scratch on the target array matches or beats zero-shot transfer (the Phase-3 gate; rehearsal in §16) |
@@ -100,7 +100,7 @@ guard that never fires is not a guard.
 | `eval/references.py` | INV-1's reference rows: PSD-matched null, AR(16), white | `validate_eval.py` |
 | `viz/topomap.py` | topographic maps; the real-vs-forecast movie | `validate_viz.py`, `run_demo.py` |
 | `data/libribrain.py`, `data/megin.py` | LibriBrain runs (incl. the partial releases pnpl misses), windows; real 306-sensor geometry | `validate_libribrain.py` |
-| `data/megmasc.py` | MEG-MASC word events in the same word table; KIT recordings filtered, resampled, cached | `validate_libribrain.py` §10, `run_megmasc_*.py` |
+| `data/megmasc.py` | MEG-MASC word events in the same word table; KIT recordings filtered, resampled, cached; a KIT montage in head coordinates from the digitised head positions | `validate_libribrain.py` §10, `run_megmasc_*.py` |
 | `decode/words.py`, `decode/baselines.py`, `decode/decoders.py`, `decode/covariates.py` | 50-word task, no-brain baselines, the pitch's four brain decoders plus EEGNet and a subject CNN, word loudness | `validate_libribrain.py`, `run_libribrain_audit.py` |
 | `audit/fake_signals.py`, `audit/timing_matched.py`, `audit/collapse.py` | onset-only control; timing-matched test; nats beyond covariates; masked-collapse diagnostic | `validate_libribrain.py`; collapse: `validate_pretrain.py` |
 | `train/pretrain.py` | real-data pre-training: warm-up + cosine, mixed precision, bit-exact resume | `validate_pretrain.py`, `run_pretrain_pilot.py` |
@@ -250,6 +250,115 @@ Decision rules:
 | Do frozen features decode equally well? (the pitch: "about equally") | "equal" if the mean BAcc@10 differs by less than 0.01; otherwise the higher arm, if all 3 seeds agree |
 | Does plain masked still collapse on ~60 h? | the diagnostic's rule: spread or context sensitivity below 0.05 |
 | Was a run long enough? | its best held-out loss came before its last evaluation; if not, it is reported as under-trained |
+
+**Results** (9 October 2026; `runs/pretrain_scale/scale_eval.json`, from
+`run_pretrain_scale.py --evaluate`, which applies the rules above itself).
+Training data: 61.3 h, with 5.9 h held out in 8 whole sessions. Six runs at
+0.29–0.32 s/step on the RTX 3050.
+
+| | Forecasting (3 seeds) | Masked + visible term (3 seeds) |
+|---|---|---|
+| person information: identity ratio, N = 2,048, ceiling 66× | **33.2 ± 2.1×** (31.4, 32.8, 35.5) | **4.8 ± 0.3×** (4.5, 5.0, 5.0) |
+| … subject probe on the same features (chance 0.031) | 0.86–0.91 | 0.20–0.23 |
+| frozen-feature word probe, BAcc@1 / BAcc@10 | 0.028 / 0.245 ± 0.007 | 0.028 / 0.246 ± 0.003 |
+| collapse diagnostic (masked) | — | all three read their input (sensitivity 0.99–1.05, hidden-patch R² 0.12–0.20) |
+| best held-out loss (not comparable across seeds or arms) | 0.529, 0.567, 0.564 | 0.851, 0.860, 0.879 |
+
+Plain masked (1 seed): **collapsed** (spread 0.000, sensitivity 0.000), identity
+13.9×, word probe 0.019 / 0.197, chance. Its outputs ignore their input, but its
+pooled features still vary by person.
+
+Raw signal on the same windows (per-channel log amplitude): 32.9×, subject probe 0.86.
+
+| Question | Verdict under the rule |
+|---|---|
+| Does forecasting leak more person information? | **more**: 6.6×, 6.3×, 7.9× fixed masked's ratio, seed by seed |
+| Do frozen features decode equally well? | **equal**: mean BAcc@10 difference −0.001 |
+| Were the runs long enough? | **no**: 5 of 6 had their best held-out loss at the last evaluation (forecasting seed 0 one evaluation earlier); both objectives were still improving at 20,000 steps (figure) |
+| Does plain masked still collapse on ~60 h? | **yes**: spread 0.000 and context sensitivity 0.000 at steps 2,000, 10,000 and on the best checkpoint; held-out loss flat at 0.978 for all 20,000 steps |
+
+![held-out loss](docs/figures/pretrain_scale_heldout.png)
+
+**What it means.** The pilot's surprise holds at ~90× the data and three seeds,
+and grows. Forecasting features carry about as much person information as the
+raw signal itself (33× against 32.9×; a probe names the listener 86–91% of the
+time). Fixed-masked features keep a seventh of it. Both decode words equally
+badly, below a linear decoder on the raw signal (0.259). For this
+configuration, **H2's kill condition is met**: the forecasting arm leaks *more*
+person information than the masked arm, not less. The configuration is the 6m
+rung, one listener's data, frozen pooled features, runs still improving at
+20,000 steps. Two things it does not settle: whether longer training changes the
+gap, and whether pre-training on many listeners (where person information has
+to be modelled rather than memorised) reverses it. The second is the setting H2
+was written for. Each seed fits its own target basis on 64 random windows, so
+held-out losses compare only within a run; that is also why seed 2's masked
+curve sits apart.
+
+### 2.3 Across many listeners — rules fixed before the run
+
+*Written 9 October 2026, before any of these runs had started.* §2.2 pre-trained
+on one person. H2 is about a model trained across many people, which has to
+model person differences rather than memorise one. Here the same comparison runs
+on MEG-MASC (`scripts/run_pretrain_multi.py`). That is also a second MEG system:
+208 KIT axial gradiometers, with a montage built from the digitised head
+positions (`megmasc.kit_montage`), so NeuroCast meets a new sensor layout with
+no new parameters.
+
+- **Data.** Pre-training: listeners 01–20, stories 0–2 (12.4 h). Held-out loss:
+  listeners 21–27, stories 0–2 (4.3 h), so "held out" means unseen people.
+  Story 3 is never pre-trained on; every evaluation uses it.
+- **Arms.** Likelihood forecasting and masked with the visible-position term,
+  3 seeds each, 10,000 steps, the §2.2 recipe otherwise; the best held-out
+  checkpoint is evaluated.
+- **Measurements.** Identity audit on story 3 of the 7 unseen listeners (64
+  windows each, N = 448, ceiling 74.5×) and of the 20 seen ones (N = 1,280,
+  ceiling 67×). Frozen-feature word probe on the unseen listeners: fit on
+  stories 0–2, test on story 3. The masked-collapse diagnostic.
+
+Decision rules (the script applies them itself):
+
+| Question | Verdict |
+|---|---|
+| Does forecasting leak more person information, about **unseen** people? (primary) | "more" if its identity ratio is above masked's for all 3 seeds; "less" if below for all 3; otherwise "no consistent difference" |
+| … about the people it was trained on? (secondary) | the same rule on the seen listeners |
+| Do frozen features decode equally well? | "equal" if mean BAcc@10 differs by less than 0.01; otherwise the higher arm, if all 3 seeds agree |
+| Was a run long enough? | best held-out loss before the last evaluation; if not, "under-trained" |
+
+If forecasting still leaks more here, H2 fails in its own setting too. If the
+gap closes or reverses, §2.2's result was single-listener memorisation.
+
+**Results** (9 October 2026; `runs/pretrain_multi/multi_eval.json`). Six runs
+at 0.19–0.20 s/step, ~32 min each.
+
+| | Forecasting (3 seeds) | Masked + visible term (3 seeds) |
+|---|---|---|
+| person information, **unseen** listeners: identity ratio (ceiling 74.5×) | **20.4, 19.1, 27.1×** | **2.7, 2.4, 2.5×** |
+| … subject probe, 7 people (chance 0.143) | 0.79–0.91 | 0.35–0.40 |
+| person information, seen listeners (ceiling 67×) | 28.7, 20.6, 33.9× | 2.6, 3.3, 3.2× |
+| frozen-feature word probe, BAcc@10 (unseen listeners, story 3) | 0.224, 0.219, 0.224 | 0.218, 0.220, 0.225 |
+| collapse diagnostic | — | all read their input (sensitivity 0.89–1.01, hidden-patch R² 0.17–0.24) |
+
+Raw signal on the same windows: 13.3× for unseen listeners (probe 0.71) and
+18.0× for seen ones.
+
+| Question | Verdict under the rule |
+|---|---|
+| More person information about unseen people? (primary) | **more**: 7.6×, 8.1×, 11.0× masked's, seed by seed |
+| … about the people trained on? | **more**: 10.9×, 6.3×, 10.5× |
+| Decode equally well? | **equal**: mean BAcc@10 difference +0.001; both near chance on MEG-MASC |
+| Long enough? | forecasting seeds 0 and 1 had their best loss at the last evaluation (under-trained); the rest peaked at steps 9,000–9,500 |
+
+**What it means.** H2 fails in the setting it was written for. Trained across
+20 people and tested on 7 it has never seen, the forecasting model's features
+carry 8–11× the person information of the masked model's. That is *more* than
+the raw signal holds (22× against 13×): it reads out who someone is from a few
+seconds of their recording. The masked model's features keep a fifth of the raw
+signal's. The gap is wider than §2.2's single-listener 6–8×, so §2.2's result
+was not memorisation. A plausible reading is that predicting a person's next
+brain state requires knowing their dynamics, so a forecaster learns to infer
+the person from context. That is H3's premise ("the subject is a prompt"), and
+it is the opposite of H2's. Two systems and two datasets now give the same
+direction.
 
 ---
 
@@ -795,8 +904,10 @@ scripts/
 ├── run_libribrain_predictability.py   beyond-spectrum predictability across/within sessions
 ├── run_phase_control.py      why the phase-scrambled control sat above chance (window means)
 ├── run_pretrain_pilot.py     forecasting vs masked pre-training on the deep listener (GPU)
-├── run_pretrain_scale.py     the same on ~35 h, 3 seeds, best held-out checkpoints (§2.2)
+├── run_pretrain_scale.py     the same on ~61 h, 3 seeds, best held-out checkpoints (§2.2)
+├── run_pretrain_multi.py     the same across 20 MEG-MASC listeners, tested on 7 unseen (§2.3)
 ├── run_decoder_sweep.py      tuned CNN, seed ensemble, subject CNN, EEGNet through the matched test
+├── run_collapse_check.py     the masked-collapse diagnostic on one checkpoint, mid-run or final
 ├── run_megmasc_timing.py     the no-brain timing test on MEG-MASC (events only)
 ├── run_megmasc_audit.py      the brain half on MEG-MASC: preprocess, decode, matched test
 ├── validate_*.py         16 validators — each built to be falsified first
@@ -806,7 +917,7 @@ tests/
 docs/recovered/          the lost version's pitch (the only surviving record) + VERIFICATION.md ledger
 pyproject.toml            numpy + torch; extras [viz], [data]
 data/ ─▶ D:\neurocast-data   junction to the external drive (git- and search-ignored)
-.ignore                   keeps code-search tools out of data/, runs/, .venv/
+.ignore                   keeps code-search tools out of /data/, /runs/, .venv/
 ```
 
 ★ = modules where a bug silently fabricates results rather than crashing. These
@@ -981,6 +1092,13 @@ identity, and story identity predicts the names: +0.029 nats/word from a decoder
 that added ~0 within every story. Classes some trials have no score for are now
 left out of that test. `validate_libribrain.py` §9 fails the old code (+0.25
 nats/word from noise) and passes the new one (exactly 0).
+
+**An unanchored ignore rule hid source code.** `.gitignore` listed `data/` to
+keep the corpus junction out of git, but the pattern matches every folder named
+`data`, including the `neurocast/data/` package. `paths.py`, `libribrain.py`,
+`megin.py` and `megmasc.py` were never committed, so the published code could
+not import its own data layer. The rules are now anchored (`/data/`, `/runs/`),
+and `data_setup.py check` warns about the unanchored form.
 
 **Blocked DLLs come back.** scipy and scikit-learn were each refused by a
 Windows Application Control policy right after install, then imported fine
@@ -1364,19 +1482,21 @@ stage.
 | Phase | Deliverable | Gate | State |
 |---|---|---|---|
 | **0** | Harness, data layer, reproduce MEG-XL, FMScope its checkpoint, the control table | published number reproduces; null controls at chance | harness ✅ · synthetic data layer ✅ · data drive + fetch ✅ · LibriBrain audit re-run ✅ (§2.1) · general real-data loader ⬜ · MEG-XL ⬜ |
-| **1** | 5-arm matched-compute bake-off | forecasting shows lower identity leakage at equal-or-better transfer | apparatus ✅ (rehearsed) · real-MEG pilot ✅ (forecasting, masked, fixed masked; 1 seed, 47.5 min) · matched-compute run ⬜ |
+| **1** | 5-arm matched-compute bake-off | forecasting shows lower identity leakage at equal-or-better transfer | apparatus ✅ (rehearsed) · real-MEG pilot ✅ · 61 h single listener, 3 seeds ✅ (§2.2) · 20 listeners, second MEG system, 3 seeds ✅ (§2.3): forecasting leaks more, decodes equally · matched-compute bake-off of all five arms ⬜ |
 | **2** | Subject-in-context vs `emb`/`lora`/`full-ft` at matched minutes | in-context ≥ fine-tuning, with lower leakage | sampler ✅ · prompt encoder ✅ · trainer ⬜ · comparators ⬜ |
 | **3** | Scaling ladder + cross-sensor transfer | zero-shot transfer beats from-scratch on an unseen array | rungs ✅ · transfer rehearsed (A > C by 1.0 SE; untrained beats both) |
 | **4** | Neural Predictability Atlas | — (architecture-independent; ships regardless) | estimators ✅ · reference rows ✅ · production run ⬜ |
 | **5** | Noisy-channel decoder + the demo | — | scorer ✅ · demo rehearsed ✅ · on a trained forecaster ⬜ |
 
-Next concrete steps, in order: (1) the forecasting pilot overfits (held-out best
-at step 2,000, worse by step 4,000) — keep the best held-out checkpoint and
-re-run the identity audit on it; (2) the pitch's own plan — forecasting vs fixed
-masked at the 6m and 25m rungs, 3 seeds, 5–20 h of the deep listener, identity
-audit at a stated N; (3) express LibriBrain recordings as `Segment`s that
-`splits.py` guards, so the general loader replaces the audit's purpose-built one;
-(4) MEG-XL through the controls, including the window-mean control (§2.1).
+Next concrete steps, in order: (1) H2 has failed twice (§2.2, §2.3), and §2.3
+suggests the forecaster reads the person from context, which is H3's premise.
+Test that directly with the subject-prompt trainer (Phase 2), which conditions
+on a separate stretch of the same person's data. (2) Train past 10,000–20,000
+steps, since forecasting runs were still improving, and check whether the
+identity gap moves. (3) Express LibriBrain recordings as
+`Segment`s that `splits.py` guards, so the general loader replaces the audit's
+purpose-built one. (4) MEG-XL through the controls, including the window-mean
+control (§2.1).
 
 **Phase 0 may produce a standalone result in days:** nobody has measured identity
 leakage in a cross-subject MEG model, and the Identity Trap paper predicts

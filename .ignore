@@ -1,8 +1,8 @@
 # Read by ripgrep and the tools built on it, inside or outside a git repository.
 # Without this, a code search in this folder walks the whole corpus behind the
 # `data` junction -- hundreds of GB on a USB hard disk.
-data/
-runs/
+/data/
+/runs/
 .venv/
 .venv-gpu/
 .env
