@@ -21,6 +21,27 @@ synthetic files laid out exactly like the Hugging Face release:
 10. MEG-MASC events: word rows only, pseudo-word rows dropped, curly
     apostrophes straightened, one key per word occurrence, and the same timing
     features as LibriBrain's.
+11. Acoustic features (README section 2.4): MEG time maps to chapter time and
+    inserted silence reads as silence; a tone lands in its band; a burst lands in
+    its window bins; the alignment check tells the right chapter from a wrong one;
+    the timing classifier uses extra columns; and information beyond a no-brain
+    model is zero for noise, for frequency and for a decoder that only repeats
+    the model, and positive for independent word information.
+12. Causal re-preprocessing (README section 2.5): the minimum-phase version puts
+    no energy before an impulse and the zero-phase one does, with one magnitude
+    response; the onset leak metric reads ~0 for a response after the onset and
+    flags the same response moved before it.
+13. The yardstick and step 2 (README section 2.6): phoneme labels parse and
+    ``oov`` drops; speech labels mark exactly the patches inside a silence; a
+    label is read from the features 64-320 ms later, so a response at +128 ms is
+    decoded and the same response read at the wrong lag is not; the probe is
+    deterministic and a shuffled-MEG row (features rolled) is at chance; macro-F1,
+    balanced accuracy and AUC match hand counts; descriptors that carry the person
+    information predict unseen listeners' feature means and their residual loses
+    it, while shuffled descriptors, descriptors that do not carry it, and a map
+    that holds only within listeners earn nothing and inject nothing (a pooled or
+    within-listener regression gets these cases wrong, which is shown); the
+    collapse measures separate a varying representation from a constant one.
 
 Run:  .venv/Scripts/python.exe scripts/validate_libribrain.py
 """
@@ -231,6 +252,9 @@ def main() -> int:
                     "time vs 100% for a frequency prior")
         ok &= matched_tests()
         ok &= megmasc_tests(tmp)
+        ok &= acoustic_tests()
+        ok &= causal_tests()
+        ok &= yardstick_tests()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -352,6 +376,263 @@ def matched_tests() -> bool:
     ok &= check("an untrained-class marker that identifies a group adds nothing",
                 leak.lo <= 0.0 <= leak.hi + 1e-3 and leak.dropped == (k - 2, k - 1),
                 f"classes left out {leak.dropped}")
+    return ok
+
+
+def acoustic_tests() -> bool:
+    """Section 11: envelope features from the stimulus audio, and information beyond them."""
+    import pandas as pd
+
+    from neurocast.audit.timing_matched import info_beyond_model
+    from neurocast.decode.baselines import TimingClassifier
+    from neurocast.decode.covariates import (
+        BAND_EDGES, alignment_check, band_power, meg_to_chapter, window_levels)
+    from neurocast.decode.metrics import balanced_accuracy_at_k
+    from neurocast.decode.words import TIMING_COLUMNS
+
+    print()
+    print("=" * 78)
+    print("11. Acoustic features and information beyond a no-brain model")
+    print("=" * 78)
+    ok = True
+    # Three events; 0.5 s of silence was inserted for presentation before the third.
+    meg, chap = np.array([10.0, 11.0, 12.5]), np.array([0.0, 1.0, 2.0])
+    c = meg_to_chapter(np.array([10.5, 11.4, 11.95, 12.2, 12.6]), meg, chap)
+    ok &= check("MEG time maps to chapter time; inserted silence maps to nothing",
+                np.allclose(c[[0, 1, 2, 4]], [0.5, 1.4, 1.95, 2.1]) and np.isnan(c[3]),
+                str(np.round(c, 3)))
+
+    rate = 22050
+    tt = np.arange(int(3.0 * rate)) / rate
+    audio = np.where((tt >= 1.0) & (tt < 1.2), 0.5 * np.sin(2 * np.pi * 1000.0 * tt), 0.0)
+    audio = (audio + 1e-4 * np.random.default_rng(3).standard_normal(len(tt))).astype(np.float32)
+    p, centres = band_power(audio, rate)
+    band_1k = int(np.searchsorted(BAND_EDGES, 1000.0, side="right") - 1)
+    loud = p[(centres > 1.05) & (centres < 1.15)].mean(0)
+    ok &= check("a 1 kHz tone puts its power in the band holding 1 kHz",
+                int(np.argmax(loud[:-1])) == band_1k and loud[-1] >= loud[:-1].sum() * 0.999,
+                f"band {int(np.argmax(loud[:-1]))}, expected {band_1k}")
+
+    lv = window_levels(p, centres, np.array([10.9, 12.0]), 0.512, meg, chap)[..., -1]
+    bins = 0.9 + (np.arange(16) + 0.5) * 0.032              # chapter-time centres, first word
+    inside = (bins > 1.0 + 0.02) & (bins < 1.2 - 0.02)
+    ok &= check("a burst lands in exactly the window bins it covers",
+                lv[0, inside].min() > lv[0, bins < 0.98].max() + 30,
+                f"burst {lv[0, inside].min():.0f} dB vs before {lv[0, bins < 0.98].max():.0f} dB")
+    ok &= check("bins inside an inserted silence read as silence",
+                lv[1].max() < lv[0, inside].min() - 30, f"{lv[1].max():.0f} dB")
+
+    ev = pd.DataFrame({"kind": ["silence", "word", "silence"], "meg": [10.0, 11.0, 11.3],
+                       "chapter": [0.0, 1.0, 1.3], "duration": [0.9, 0.2, 1.0]})
+    right = alignment_check(audio, rate, ev)
+    wrong = alignment_check(np.roll(audio, int(1.5 * rate)), rate, ev)
+    ok &= check("the alignment check tells the right chapter from a wrong one",
+                right["contrast_db"] > 20 and abs(wrong["contrast_db"]) < 10,
+                f"right {right['contrast_db']:+.0f} dB, wrong {wrong['contrast_db']:+.0f} dB")
+
+    g = np.random.default_rng(11)
+    n, k = 3000, 5
+    yy = g.integers(0, k, n)
+    df = pd.DataFrame({c: np.nan for c in TIMING_COLUMNS}, index=range(n))
+    df["next1"] = g.uniform(0.1, 0.4, n)
+    df["gap_prev"], df["pos_in_sentence"] = 0.0, 1.0
+    df["env"] = yy + 0.3 * g.standard_normal(n)
+    a = TimingClassifier().fit(df[:2000], yy[:2000], k).log_proba(df[2000:])
+    b = TimingClassifier(extra=("env",)).fit(df[:2000], yy[:2000], k).log_proba(df[2000:])
+    ba, bb = balanced_accuracy_at_k(a, yy[2000:], 1), balanced_accuracy_at_k(b, yy[2000:], 1)
+    ok &= check("the classifier reads extra columns, and nothing without them",
+                bb > 0.8 and ba < 0.35, f"with {bb:.2f}, without {ba:.2f} (chance 0.20)")
+
+    k, n_occ, listeners = 10, 600, 3
+    y_occ = g.integers(0, k, n_occ)
+    y = np.repeat(y_occ, listeners)
+    occ = np.repeat(np.arange(n_occ), listeners).astype(str)
+    feat = np.repeat(y_occ // 2 + 0.3 * g.standard_normal(n_occ), listeners)
+    base = -((feat[:, None] - (np.arange(k) // 2)[None]) ** 2) / 0.2
+    base = base - np.log(np.exp(base).sum(1, keepdims=True))
+    # Unequal word frequencies, as in speech: a frequency-only score must still add nothing.
+    keep = g.random(len(y)) < np.exp(-0.25 * y)
+    y, occ, base = y[keep], occ[keep], base[keep]
+    logfreq = np.log(np.bincount(y, minlength=k) + 1.0)
+
+    def beyond(scores):
+        return info_beyond_model(base, scores, y, occ, prior=logfreq, n_boot=200)
+
+    res = {
+        "noise": beyond(g.standard_normal((len(y), k))),
+        "frequency": beyond(np.tile(logfreq, (len(y), 1))),
+        "repeats the model": beyond(base + 0.3 * g.standard_normal(base.shape)),
+        "word information": beyond(1.5 * np.eye(k)[y] + g.standard_normal((len(y), k))),
+    }
+    for name, r in res.items():
+        print(f"  beyond the no-brain model, {name:<18} {r}")
+    ok &= check("noise adds nothing beyond the model", res["noise"].lo <= 0.0 <= res["noise"].hi + 1e-3)
+    ok &= check("frequency adds nothing beyond the model", abs(res["frequency"].nats) < 0.01)
+    ok &= check("a decoder that repeats the model adds ~nothing",
+                res["repeats the model"].nats < 0.02, str(res["repeats the model"]))
+    ok &= check("independent word information adds positive nats", res["word information"].lo > 0.05)
+    return ok
+
+
+def causal_tests() -> bool:
+    """Section 12: the causal re-preprocessing filters (README section 2.5), and the leak metric."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from run_causal_check import impulse_check, onset_leak
+
+    print()
+    print("=" * 78)
+    print("12. Zero-phase vs causal filters, and the onset leak metric")
+    print("=" * 78)
+    ok = True
+    r = impulse_check()
+    ok &= check("the causal version puts no energy before an impulse; zero-phase does",
+                r["pre_energy_C"] < 1e-9 and r["pre_energy_Z"] > 1e-3,
+                f"Z {100 * r['pre_energy_Z']:.1f}%, C {100 * r['pre_energy_C']:.1e}%")
+    ok &= check("both versions share one magnitude response over the passband",
+                r["max_magnitude_difference_db"] < 0.1, f"{r['max_magnitude_difference_db']:.4f} dB")
+
+    g = np.random.default_rng(5)
+    sf, n_on = 250.0, 300
+    onsets = 5.0 + 4.0 * np.arange(n_on)
+    t = np.arange(int((onsets[-1] + 5) * sf)) / sf
+    kernel = np.exp(-((np.arange(-50, 51) / sf) / 0.03) ** 2)       # a 30 ms bump
+    topo = g.standard_normal(20)
+
+    def signal(lead_s):
+        s = np.zeros(len(t))
+        for o in onsets:
+            i = int(round((o + 0.1 - lead_s) * sf))
+            s[i - 50:i + 51] += kernel
+        return topo[:, None] * s[None] + 0.5 * g.standard_normal((20, len(t)))
+
+    clean = onset_leak(signal(0.0), onsets, sf)["leak"]
+    early = onset_leak(signal(0.15), onsets, sf)["leak"]
+    print(f"  leak, response at +100 ms: {100 * clean:+.1f}%   moved 150 ms earlier: {100 * early:+.1f}%")
+    ok &= check("a response after the onset reads as no leak", abs(clean) < 0.05)
+    ok &= check("the same response moved before the onset reads as a leak", early > 0.3)
+    return ok
+
+
+def yardstick_tests() -> bool:
+    """Section 13: labels, lags, probe, metrics and descriptor regression (README 2.6)."""
+    from neurocast.audit.fmscope import subject_variance
+    from neurocast.eval.yardstick import (PATCH_S, PHONEMES, LinearProbe, auc, balanced_accuracy,
+                                          cross_listener, lagged, leace, macro_f1, phoneme_class,
+                                          residualise, speech_labels, spread, usable)
+    from neurocast.audit.fmscope import linear_probe_accuracy
+
+    ok = True
+    print()
+    print("=" * 78)
+    print("13. Yardstick labels, lags and probe; regressing descriptors out of features")
+    print("=" * 78)
+    ok &= check("phoneme labels parse; stress and position split off; oov dropped",
+                phoneme_class("uh_I") == (PHONEMES.index("uh"), 1)
+                and phoneme_class("AH0_B") == (PHONEMES.index("ah"), 0)
+                and phoneme_class("oov_S") == (-1, -1))
+    lab = speech_labels([1.0], [0.5], 40)
+    c = (np.arange(40) + 0.5) * PATCH_S
+    ok &= check("speech labels are 0 exactly where a patch centre is inside a silence",
+                np.array_equal(lab == 0, (c >= 1.0) & (c < 1.5)), f"{int((lab == 0).sum())} silent patches")
+    f = np.arange(20, dtype=float)[:, None]
+    v = np.ones(20, bool)
+    v[10] = False
+    idx = np.arange(20)
+    u = usable(idx, v)
+    ok &= check("lagged features are the 1-4 patches after the label; gaps and ends excluded",
+                np.array_equal(lagged(f, [3])[0], [4, 5, 6, 7])
+                and not u[6:10].any() and u[5] and u[11:16].all() and not u[16:].any())
+
+    pred, y = np.array([0, 0, 1, 1, 2, 2]), np.array([0, 1, 1, 1, 2, 0])
+    # Class F1: 0 -> 1/2, 1 -> 4/5, 2 -> 2/3; recall: 1/2, 2/3, 1.
+    ok &= check("macro-F1 and balanced accuracy match hand counts",
+                abs(macro_f1(pred, y, 3) - (0.5 + 0.8 + 2 / 3) / 3) < 1e-9
+                and abs(balanced_accuracy(pred, y, 3) - (0.5 + 2 / 3 + 1) / 3) < 1e-9)
+    yb = np.array([0, 0, 1, 1])
+    ok &= check("AUC: 1 for a perfect score, 0 reversed, 0.5 for ties",
+                auc(np.array([0.1, 0.2, 0.8, 0.9]), yb) == 1.0 and auc(-np.array([0.1, 0.2, 0.8, 0.9]), yb) == 0.0
+                and auc(np.zeros(4), yb) == 0.5)
+
+    # A patch label whose response shows up two patches (128 ms) later.
+    g = np.random.default_rng(0)
+    n, d, k = 6000, 16, 4
+    labels = g.integers(0, k, n)
+    pattern = g.standard_normal((k, d))
+    feats = g.standard_normal((n, d))
+    feats[2:] += 1.5 * pattern[labels[:-2]]
+    feats = feats.astype(np.float16)
+    i = np.arange(n - 8)
+    tr, te = i[i < 4000], i[i >= 4000]
+    p1 = LinearProbe(k, 1e-3, epochs=6).fit(lagged(feats, tr), labels[tr])
+    p2 = LinearProbe(k, 1e-3, epochs=6).fit(lagged(feats, tr), labels[tr])
+    f_ok = macro_f1(p1.predict(lagged(feats, te)), labels[te], k)
+    wrong = LinearProbe(k, 1e-3, epochs=6).fit(lagged(feats, tr + 6, lags=(0, 1)), labels[tr])
+    f_wrong = macro_f1(wrong.predict(lagged(feats, te + 6, lags=(0, 1))), labels[te], k)
+    rolled = np.roll(feats, n // 2, axis=0)
+    sh = LinearProbe(k, 1e-3, epochs=6).fit(lagged(rolled, tr), labels[tr])
+    f_sh = macro_f1(sh.predict(lagged(rolled, te)), labels[te], k)
+    print(f"  macro-F1: lags 1-4 {f_ok:.3f}   wrong lag {f_wrong:.3f}   shuffled {f_sh:.3f}   (chance {1 / k:.2f})")
+    ok &= check("the response 128 ms after the label is decoded", f_ok > 0.9)
+    ok &= check("read at the wrong lag, or from rolled features, it is at chance",
+                f_wrong < 0.35 and f_sh < 0.35)
+    ok &= check("the probe is deterministic",
+                np.array_equal(p1.scores(lagged(feats, te)), p2.scores(lagged(feats, te))))
+
+    # Person information carried by descriptors, and person information that is not.
+    # 40 descriptor dimensions for 32 listeners: enough to span the listener means,
+    # as 64 spectral components do on the real data.
+    subj = np.repeat(np.arange(32), 64)
+    md = g.standard_normal((32, 40))
+    desc = md[subj] + 0.5 * g.standard_normal((len(subj), 40))
+    w = g.standard_normal((40, 24))
+    through = desc @ w + 0.5 * g.standard_normal((len(subj), 24))
+    beside = g.standard_normal((32, 24))[subj] + 0.5 * g.standard_normal((len(subj), 24))
+    # Features that follow spectra within a listener, with listener means that do not.
+    within = (desc - md[subj]) @ w + 2.0 * g.standard_normal((32, 24))[subj] \
+        + 0.5 * g.standard_normal((len(subj), 24))
+    perm = np.random.default_rng(1).permutation(len(subj))
+    r = lambda z: subject_variance(z, subj, n_permutations=30).ratio_to_null  # noqa: E731
+    ct, cs, cb, cw = (cross_listener(through, desc, subj), cross_listener(through, desc[perm], subj),
+                      cross_listener(beside, desc, subj), cross_listener(within, desc, subj))
+    a0, b0, w0 = r(through), r(beside), r(within)
+    print(f"  listener means predicted for unseen listeners, R^2: carried {ct['r2_between']:.2f}, "
+          f"shuffled {cs['r2_between']:.2f}, not carried {cb['r2_between']:.2f}, within only "
+          f"{cw['r2_between']:.2f}")
+    print(f"  identity: carried {a0:.1f}x -> {r(ct['residual']):.1f}x (shuffled {r(cs['residual']):.1f}x); "
+          f"not carried {b0:.1f}x -> {r(cb['residual']):.1f}x; within only {w0:.1f}x -> "
+          f"{r(cw['residual']):.1f}x, but {r(residualise(within, desc, subj)):.1f}x after a within-listener "
+          f"fit and {r(residualise(beside, desc)):.1f}x for 'not carried' after a pooled fit")
+    ok &= check("spectra that carry the person information predict unseen listeners, and its "
+                "residual loses it", ct["r2_between"] > 0.8 and r(ct["residual"]) < 0.2 * a0)
+    ok &= check("shuffled descriptors predict nothing and remove nothing",
+                cs["r2_between"] < 0.1 and r(cs["residual"]) > 0.7 * a0)
+    ok &= check("person information the descriptors do not carry: nothing predicted, all kept",
+                cb["r2_between"] < 0.1 and r(cb["residual"]) > 0.7 * b0)
+    ok &= check("a map that holds only within listeners earns no credit and injects nothing",
+                cw["r2_between"] < 0.25 and r(cw["residual"]) < 1.3 * w0)
+    ok &= check("why: a within-listener fit, subtracted, injects identity; a pooled fit "
+                "removes what descriptors do not carry",
+                r(residualise(within, desc, subj)) > 1.5 * w0 and r(residualise(beside, desc)) < 0.5 * b0)
+    # LEACE: person means erased, a within-person signal kept.
+    people = np.repeat(np.arange(12), 50)
+    signal = g.standard_normal(len(people))
+    feats = (3.0 * g.standard_normal((12, 16))[people] + np.outer(signal, g.standard_normal(16))
+             + 0.3 * g.standard_normal((len(people), 16)))
+    erased = leace(feats, people)(feats)
+    means = np.stack([erased[people == i].mean(0) for i in range(12)])
+    kept = abs(np.corrcoef(erased @ np.linalg.lstsq(erased, signal, rcond=None)[0], signal)[0, 1])
+    probe = linear_probe_accuracy(erased, people)
+    ok &= check("LEACE: every person's mean is the same afterwards, a nearest-centroid probe is at "
+                "chance, and a signal that varies within people survives",
+                np.abs(means - means.mean(0)).max() < 1e-8 and probe < 2.5 / 12 and kept > 0.9,
+                f"probe {probe:.3f} (chance {1 / 12:.3f}), within-person signal r {kept:.3f}")
+    z = g.standard_normal((500, 8)) @ g.standard_normal((8, 32))
+    sp_ok, sp_flat = spread(z), spread(np.ones((500, 32)) + 1e-6 * g.standard_normal((500, 32)))
+    ok &= check("collapse measures: a varying representation spreads, a constant one does not",
+                sp_ok["varying"] > 0.5 and 2 < sp_ok["participation"] <= 8.5
+                and sp_flat["varying"] < 1e-6,
+                f"varying {sp_ok['varying']:.2f} vs {sp_flat['varying']:.1e}; participation "
+                f"{sp_ok['participation']:.1f} (8 directions)")
     return ok
 
 

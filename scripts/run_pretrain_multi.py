@@ -60,11 +60,12 @@ def cache_dir() -> Path:
 
 def montage():
     """The KIT montage, computed once from the training listeners' head positions."""
-    f = OUT / "montage.pkl"
+    # One montage for every run directory: --out reruns share the original's.
+    f = ROOT / "runs" / "pretrain_multi" / "montage.pkl"
     if f.exists():
         return pickle.loads(f.read_bytes())
     m = megmasc.kit_montage(list(TRAIN))
-    OUT.mkdir(parents=True, exist_ok=True)
+    f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(pickle.dumps(m))
     return m
 
@@ -259,7 +260,13 @@ def main() -> int:
     ap.add_argument("--queue", action="store_true")
     ap.add_argument("--evaluate", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--steps", type=int, help="training steps (default 10,000; README 18 step 10)")
+    ap.add_argument("--out", type=Path, help="run directory (default runs/pretrain_multi)")
     args = ap.parse_args()
+    global OUT, STEPS
+    if args.out:
+        OUT = args.out.resolve()
+    STEPS = args.steps or STEPS
     OUT.mkdir(parents=True, exist_ok=True)
     if args.prepare:
         return cmd_prepare(args)

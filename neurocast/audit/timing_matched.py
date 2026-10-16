@@ -40,6 +40,7 @@ __all__ = [
     "matched_gain",
     "BeyondResult",
     "info_beyond_covariates",
+    "info_beyond_model",
 ]
 
 
@@ -242,7 +243,11 @@ def info_beyond_covariates(cov: np.ndarray, brain: np.ndarray, y: np.ndarray, oc
         base = _log_softmax(logit[te])[np.arange(len(te)), yi[te]]
         both = _log_softmax(logit[te] + beta * sc[te])[np.arange(len(te)), yi[te]]
         d[te] = both - base
+    return _summarise(d, y, occ, n_boot, seed)
 
+
+def _summarise(d, y, occ, n_boot, seed) -> BeyondResult:
+    """Class-balanced mean of per-trial gains, bootstrap over word occurrences."""
     def balanced(idx):
         yy, dd = y[idx], d[idx]
         return float(np.mean([dd[yy == c].mean() for c in np.unique(yy)]))
@@ -256,3 +261,69 @@ def info_beyond_covariates(cov: np.ndarray, brain: np.ndarray, y: np.ndarray, oc
         boots.append(balanced(np.concatenate([members[k] for k in pick])))
     return BeyondResult(balanced(np.arange(len(y))), float(np.percentile(boots, 2.5)),
                         float(np.percentile(boots, 97.5)))
+
+
+def _standardise_scores(brain: np.ndarray) -> np.ndarray:
+    s = np.where(np.isfinite(brain), brain, np.nan)
+    s = s - np.nanmean(s, axis=1, keepdims=True)
+    return np.nan_to_num(s / (np.nanstd(s) + 1e-12), nan=-10.0)
+
+
+def info_beyond_model(base_logp: np.ndarray, brain: np.ndarray, y: np.ndarray, occ: np.ndarray,
+                      *, prior: np.ndarray | None = None, n_folds: int = 5, n_boot: int = 1000,
+                      seed: int = 0, a_grid=np.linspace(0.05, 2.0, 40),
+                      b_grid=np.linspace(-1.0, 4.0, 101),
+                      c_grid=np.linspace(0.0, 1.5, 16)) -> BeyondResult:
+    """Held-out gain of a decoder over a fixed no-brain model, three weights in all.
+
+    ``base_logp`` is a no-brain model's log-probabilities for these trials, from
+    a model trained elsewhere (README section 2.4: the stimulus-only classifier,
+    trained on other chapters). ``prior`` is a fixed log word frequency (a
+    class-balanced classifier carries none).
+    ``log p(k) = log_softmax(a * base_k + c * prior_k + beta * s_k)`` against the
+    same with ``beta = 0``; ``a``, ``c`` (and ``beta``) are fitted on the training
+    folds (folds cut by word occurrence), the reference refitted alone so it is
+    the base model at its own best temperature and prior weight. With three
+    weights there is nothing to overfit: frequency, and a decoder that only
+    repeats the base model's information, earn ~0. Unscored classes are left out
+    as in :func:`info_beyond_covariates`.
+    """
+    from sklearn.model_selection import GroupKFold
+
+    brain = np.asarray(brain, float)
+    unscored = np.flatnonzero((~np.isfinite(brain) | (brain <= UNSCORED)).any(0))
+    if unscored.size:
+        keep_cls = np.setdiff1d(np.arange(brain.shape[1]), unscored)
+        rows = np.isin(y, keep_cls)
+        remap = np.full(brain.shape[1], -1)
+        remap[keep_cls] = np.arange(len(keep_cls))
+        r = info_beyond_model(base_logp[rows][:, keep_cls], brain[rows][:, keep_cls],
+                              remap[y[rows]], occ[rows],
+                              prior=None if prior is None else np.asarray(prior)[keep_cls],
+                              n_folds=n_folds, n_boot=n_boot, seed=seed, a_grid=a_grid,
+                              b_grid=b_grid, c_grid=c_grid)
+        return BeyondResult(r.nats, r.lo, r.hi, tuple(int(c) for c in unscored))
+
+    base = np.asarray(base_logp, float)
+    base = np.where(np.isfinite(base), base, np.nanmin(np.where(np.isfinite(base), base, 0.0)) - 30.0)
+    pri = np.zeros(base.shape[1]) if prior is None else np.asarray(prior, float)
+    c_grid = np.array([0.0]) if prior is None else np.asarray(c_grid)
+    s = _standardise_scores(brain)
+
+    def ll(idx, a, c, b):
+        return _log_softmax(a * base[idx] + c * pri + b * s[idx])[np.arange(len(idx)), y[idx]]
+
+    def ascend(idx, a, c, b, fit_b):            # coordinate ascent, twice round
+        for _ in range(2):
+            if fit_b:
+                b = max(b_grid, key=lambda v: ll(idx, a, c, v).sum())
+            a = max(a_grid, key=lambda v: ll(idx, v, c, b).sum())
+            c = max(c_grid, key=lambda v: ll(idx, a, v, b).sum())
+        return a, c, b
+
+    d = np.full(len(y), np.nan)
+    for tr, te in GroupKFold(n_splits=n_folds).split(base, y, groups=occ):
+        a0, c0, _ = ascend(tr, 1.0, 0.0, 0.0, fit_b=False)
+        a, c, b = ascend(tr, a0, c0, 0.0, fit_b=True)
+        d[te] = ll(te, a, c, b) - ll(te, a0, c0, 0.0)
+    return _summarise(d, y, occ, n_boot, seed)

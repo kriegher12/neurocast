@@ -141,6 +141,28 @@ beyond timing, length and loudness. The best here finds 6× the linear decoder's
 and the share of its gain that survives matching stays near 50–60%. A per-listener
 spatial layer hurts, probably by overfitting ~1,000 trials per person.
 
+### Acoustic covariates (README §2.4, added 13 October 2026)
+
+The pitch had no audio model. With every chapter's audio, a no-brain classifier
+that also hears the window's broadband envelope scores 0.311 / 0.786 on these
+trials. With 8 band envelopes it scores 0.710 / 0.969. Both "survive matching"
+(56% and 95%), so the matched test above does not control acoustics.
+
+Against the band-envelope model, the decoders in the tables above keep an eighth
+to a quarter of their "beyond covariates" nats:
+
+| Decoder | Beyond timing, length, loudness | Beyond the band-envelope model |
+|---|---|---|
+| linear | +0.008 | +0.002 (interval includes 0) |
+| EEGNet | +0.033 | +0.004 |
+| CNN | +0.031 | +0.003 (interval includes 0) |
+| tuned CNN, 5 seeds | +0.048 | +0.006 |
+
+Under the competition protocol, no decoder adds anything beyond it. The ✅ on
+"about half of the gain survives matching" stands as a reproduction of the
+pitch's number. It no longer supports the pitch's reading that the surviving
+half is word identity.
+
 ## 4b. Under the competition's own protocol
 
 The pitch: "In the competition's test data, word onsets within each sentence are
@@ -286,19 +308,57 @@ band-limited signals — `validate_atlas.py` section 11).
 | 16-sample (64 ms) patches; 8 latents per group, 5 groups, 1 cross layer → 5 tokens per patch | defaults in `tokenizer/perceiver.py` | ✅ |
 | transformer with rotary encoding, sliding window 256, causal for forecasting, **bidirectional for masked** | matches — the bidirectional masked trunk was re-derived independently in this rebuild (README §9) | ✅ |
 | rungs: tiny 1.3M · 6m 24.9M · 25m 62.7M ("names are historical") | **1.3M · 24.9M · 62.7M** (90m 182.8M, 320m 475.5M) | ✅ |
-| seven objectives: masked, masked spectral, JEPA, latent forecasting, likelihood forecasting, CPC, eye/heart | five arms; masked-spectral exists only as an option; **CPC missing** | ❌ partial |
+| seven objectives: masked, masked spectral, JEPA, latent forecasting, likelihood forecasting, CPC, eye/heart | five arms; masked-spectral exists only as an option; **CPC missing**. JEPA and latent forecasting now train on real MEG (`train/pretrain.py`; README §2.6); eye/heart cannot, as the release has no peripheral channels | ❌ partial |
 | masked target: hidden 1-s blocks (40%) of whitened per-region PCA, rank 32; visible-position term (weight 1.0) | rebuilt in `train/pretrain.py` and `MaskedReconstruction(visible_weight=…)` | ✅ (rebuilt) |
 | trainer: AdamW 1e-3, betas (0.9, 0.95), wd 0.01, clip 1.0 | same | ✅ |
 | 100 warm-up steps, cosine to 10%, mixed precision, bit-exact resume | rebuilt; resume verified bit-exact on CPU for both arms (`validate_pretrain.py`); bf16 on the RTX 3050 | ✅ (rebuilt) |
 | multi-GPU via torchrun ("written, not yet tested") | not rebuilt | — |
 | 6m rung pilot at 0.18 s/step on an RTX 4050 | **0.21–0.25 s/step** on this machine's RTX 3050 4 GB (bf16); 15–18 min per arm | ≈ (slower GPU) |
-| masked model collapsed on real data: "its output ignored its input" | plain masked arm at step 4,000, 48 held-out windows: prediction spread **0.000**, sensitivity to swapped context **0.000**, R² 0.000 — **COLLAPSED** | ✅ — and on 61 h too: collapsed at steps 2,000 and 10,000, held-out flat at 0.978 (README §2.2) |
+| masked model collapsed on real data: "its output ignored its input" | plain masked arm at step 4,000, 48 held-out windows: prediction spread **0.000**, sensitivity to swapped context **0.000**, R² 0.000 — **COLLAPSED** | ✅ — and on 61 h too: collapsed at steps 2,000 and 10,000, held-out flat at 0.978 (README §2.2); still collapsed after 60,000 steps |
 | fixed by also scoring visible positions (weight 1.0) | spread 0.076, sensitivity **0.95**, R² **+0.069** — reads its input | ✅ |
 | a diagnostic script checks any masked checkpoint | `audit/collapse.py`, validated on AR(1) targets (`validate_pretrain.py` §5) | ✅ (rebuilt) |
 | "a linear predictor recovers 34–48% of a hidden patch from its neighbours" | one patch hidden, ±2 patches of the same region visible: **14%**; under the pitch's own 1-s block masks: −4.5% (the neighbours are hidden too) | ❌ lower (target definition — whitened rank-32 components, every component weighted equally — may differ) |
 | "lower learning rates and other targets still collapse" | masked at lr 3e-4 (else identical): held-out 0.906, spread 0.000, sensitivity 0.000 — **COLLAPSED**; other targets not re-run | ✅ lower LR; — other targets |
-| forecasting features carry ~3× more person information than masked (29× vs 10×) | at N = 2,048 windows (64 per listener, ceiling 66×): forecasting **11.8×**, fixed masked **4.9×** — **2.4×** more; at N = 384 (ceiling 12.4×): 3.1× vs 1.8× | ≈ direction and ratio; absolute values depend on N, which the pitch does not give. **At scale** (61 h, 3 seeds, best checkpoints, README §2.2): forecasting **33.2×**, fixed masked **4.8×**, 6–8× more in every seed. The direction holds and the gap widens; forecasting's 33× is close to the pitch's 29× |
+| forecasting features carry ~3× more person information than masked (29× vs 10×) | at N = 2,048 windows (64 per listener, ceiling 66×): forecasting **11.8×**, fixed masked **4.9×** — **2.4×** more; at N = 384 (ceiling 12.4×): 3.1× vs 1.8× | ≈ direction and ratio; absolute values depend on N, which the pitch does not give. **At scale** (61 h, 3 seeds, best checkpoints, README §2.2): forecasting **33.2×**, fixed masked **4.8×**, 6–8× more in every seed. The direction holds and the gap widens; forecasting's 33× is close to the pitch's 29×. **At 3× the training** (60,000 steps): forecasting **39.1×**, fixed masked **9.2×**, 3–5× more in every seed. The gap narrows but holds. **Against JEPA and causal latent forecasting at matched FLOPs** (README §2.6): forecasting carries 1.3–1.5× and 1.8–2.1× more, so it leaks the most of four objectives. Spectra predict about half of its listener differences for unseen listeners; net of that it keeps ~5× masked's |
 | raw signal: 3× | per-channel log amplitude of the same 4-s windows: **32.9×** (N 2,048); 64 ms patch means of word windows: 1.8× (§3) | ❌ — neither raw feature gives 3×; the pitch's raw feature is unstated |
-| "the two approaches decode about equally well" | frozen features, same linear probe and split as §3: forecasting **0.027 / 0.243**, fixed masked **0.028 / 0.242**; collapsed masked 0.020 / 0.202 (chance) | ✅ — both below the raw-signal linear decoder (0.259); at scale, 0.245 vs 0.246 (3 seeds each) |
+| "the two approaches decode about equally well" | frozen features, same linear probe and split as §3: forecasting **0.027 / 0.243**, fixed masked **0.028 / 0.242**; collapsed masked 0.020 / 0.202 (chance) | ✅ — both below the raw-signal linear decoder (0.259); at scale, 0.245 vs 0.246 (3 seeds each); at 60,000 steps, 0.239 vs 0.245, neither better than at 20,000. Also equal on speech detection, phonemes and voicing (README §2.6), where neither beats a probe on the raw signal |
 | held-out loss tracking | forecasting overfits: held-out best 0.753 (step 2,000), 0.827 at step 4,000, train 0.41; the evaluation uses the final checkpoint, as the pitch's 4,000-step recipe implies | — (the pitch gives no held-out numbers) |
 | 18 validation scripts, `scripts/run_all_checks.py --fast` | 16 validators, `scripts/run_all.py` | ≈ (different set) |
+
+### Four objectives at matched compute (README §2.6, added 15 October 2026)
+
+The pitch compared two objectives on words. This adds JEPA and causal latent
+forecasting at matched measured FLOPs, scored on three tasks with brain signal.
+All four objectives use §2.2's data and model, 3 seeds each, frozen features,
+single trials, held-out chapter 12.
+
+| Measure | Forecasting | Masked + visible | JEPA | Causal latent | Raw signal | No brain |
+|---|---|---|---|---|---|---|
+| person information | 33.2× | 4.8× | 23.2× | 16.7× | 32.9× | — |
+| words, BAcc@10 | 0.245 | 0.246 | 0.219 | 0.244 | 0.259 | 0.68 (timing) |
+| speech vs silence, macro-F1 (0.5 h of labels) | 0.662 | 0.654 | 0.539 | 0.625 | 0.686 | 0.434 (prior) |
+| 39 phonemes, macro-F1 | 0.016 | 0.019 | 0.016 | 0.018 | 0.016 | **0.065** (timing) |
+| voicing, BAcc | 0.524 | 0.520 | 0.514 | 0.517 | 0.538 | **0.625** (timing) |
+
+Nothing decodes better than forecasting, and nothing beats the raw signal. JEPA
+is worse on speech and words. On phonemes and voicing, a model given only each
+phoneme's timing beats every brain row: single trials of these are timing tasks,
+as the 50-word task is (§2 and §4).
+
+More pre-training data (1, 4, 16 and 61 h; two seeds) improved forecasting's
+held-out loss up to 16 h but no task score. Its person information rose from
+11–13× at 1 h to 31–33× at 61 h, while masked's stayed at 4–9×.
+
+### Beyond the pitch: fine-tuning, unseen people, the stimulus (README §2.7–2.11, added 16 October 2026)
+
+None of these were pitch claims. They test what the pitch's plan implied: that
+pre-training helps decoding, and that the forecaster's person information is
+about people.
+
+| Test | Result |
+|---|---|
+| Fine-tuning each pre-trained start against training from scratch, speech detection (§2.7) | every pre-trained start is **below** scratch of the same causality at 0.5 h of labels (forecasting −0.018 F1, masked + visible −0.032, causal latent −0.031, JEPA −0.123), and all but causal latent still are at 3.2 h. Verdict: dead end on this data and model, pending §2.12 (learning rates, linear probe first, memorisation) |
+| Removing person information while fine-tuning, 8 unseen people (§2.8) | adversarial training **raised** it (2.2–4.4×); instance normalisation changed it little; masked + visible stays lowest and decodes unseen people best; LEACE fitted on 20 people removes 31–44% from new people |
+| Recognising a person in another chapter's recording (§2.8) | pre-trained forecasting 57–63% among 20 people, masked + visible 19–22% (chance 5%) |
+| Information beyond no-brain models (§2.9) | raw signal: 0.17 nats per patch on speech, 0.012 per phoneme, 0.004 on voicing, all above zero; no pre-trained model keeps the phoneme or voicing share |
+| Forecasting people never seen (§2.11) | beats a linear predictor fitted to each new person for only 31–41% of 32 unseen listeners (median 0.07–0.15 nats/dim worse), against 0.28–0.33 better on the listener it was trained on |

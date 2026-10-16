@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -368,9 +369,172 @@ def stage_matched(args) -> dict:
     return res
 
 
+#: Stimulus-only rungs (README section 2.4) by their extra columns; rung A is timing alone.
+RUNGS = ("A", "B", "C", "D")
+
+
+def rung_columns(n_bins: int, n_bands: int) -> dict:
+    env = tuple(f"env{j:02d}" for j in range(n_bins))
+    bands = tuple(f"b{b}_{j:02d}" for b in range(n_bands) for j in range(n_bins))
+    base = ("duration", "loudness_rel")
+    return {"A": (), "B": base, "C": base + env, "D": base + env + bands}
+
+
+def add_acoustics(trials, run, window_s: float, cache: dict):
+    """Envelope columns for one run's trials, or ``None`` if its audio fails the alignment check.
+
+    Levels are dB relative to the session's median word level, floored 60 dB below.
+    ``cache`` keeps the last chapter's audio and band power (32 listeners share one).
+    """
+    import pandas as pd
+
+    from neurocast.decode.covariates import (
+        alignment_check, band_power, chapter_audio_path, event_times, read_wav, window_levels,
+        word_loudness_db)
+
+    key = f"{run.task} ses-{run.session}"
+    try:
+        path = chapter_audio_path(dataset_dir("LibriBrain100"), run.task, run.session)
+    except FileNotFoundError:
+        return None, {"session": key, "status": "no audio"}
+    if cache.get("path") != path:
+        audio, rate = read_wav(path)
+        p, centres = band_power(audio, rate)
+        cache.clear()
+        cache.update(path=path, audio=audio, rate=rate, p=p, centres=centres)
+    audio, rate, p, centres = cache["audio"], cache["rate"], cache["p"], cache["centres"]
+    ev = event_times(run.events)
+    chk = {"session": key, "audio": path.name, **alignment_check(audio, rate, ev)}
+    if not (chk["contrast_db"] >= 10.0 and chk["overrun_s"] <= 0.05):
+        return None, {**chk, "status": "failed alignment"}
+    ref = chk["word_level_db"]
+    lv = window_levels(p, centres, trials["onset"].to_numpy(), window_s,
+                       ev["meg"].to_numpy(), ev["chapter"].to_numpy())
+    lv = np.maximum(lv - ref, -60.0)
+    n_bins, n_cols = lv.shape[1], lv.shape[2]
+    cols = {"loudness_rel": np.maximum(word_loudness_db(
+        audio, rate, trials["t_chapter"].to_numpy(), trials["duration"].to_numpy()) - ref, -60.0)}
+    cols.update({f"env{j:02d}": lv[:, j, -1] for j in range(n_bins)})
+    cols.update({f"b{b}_{j:02d}": lv[:, j, b] for b in range(n_cols - 1) for j in range(n_bins)})
+    out = pd.concat([trials.reset_index(drop=True), pd.DataFrame(cols)], axis=1)
+    out.index = trials.index
+    return out, {**chk, "status": "ok"}
+
+
+def stage_acoustic(args) -> dict:
+    """Stimulus-only rungs A-D, the matched test on them, and information beyond them."""
+    import pandas as pd
+
+    from neurocast.audit.timing_matched import info_beyond_model, matched_gain
+    from neurocast.decode.covariates import BAND_EDGES, BIN_S
+
+    t0 = time.time()
+    nb = json.loads((OUT / "nobrain.json").read_text())
+    vocab, K = nb["vocab"], len(nb["vocab"])
+    n_bins, n_bands = int(round(args.window / BIN_S)), len(BAND_EDGES) - 1
+    cols = rung_columns(n_bins, n_bands)
+    print(f"window {args.window:.3f} s = {n_bins} bins of {BIN_S * 1000:.0f} ms; {K} words; "
+          f"{n_bands} bands {BAND_EDGES[0]:.0f}-{BAND_EDGES[-1]:.0f} Hz")
+
+    # Training trials: the deep listener's Sherlock sessions with audio, minus the
+    # test chapters and Sherlock 4 chapter 8 (annotation errors, README section 9).
+    exclude = TEST_CHAPTERS | {("Sherlock4", "8")}
+    runs = [r for r in deep_listener_words(exclude, tasks_prefix="Sherlock", window_s=args.window)[0]]
+    print(f"training: {len(runs)} sub-0 sessions; reading each chapter's audio ...", flush=True)
+    cache, checks, parts = {}, [], []
+    for r in runs:
+        t = label_trials(word_table([r], window_s=args.window), vocab)
+        feat, c = add_acoustics(t, r, args.window, cache)
+        checks.append(c)
+        if feat is not None:                    # envelope columns as float32: ~190k rows x 150
+            env_cols = [k for k in feat.columns if re.fullmatch(r"env\d+|b\d+_\d+", k)]
+            parts.append(feat.astype(dict.fromkeys(env_cols, np.float32)))
+        mark = "" if c["status"] == "ok" else f"   <- {c['status']}"
+        if "contrast_db" in c:
+            print(f"  {c['session']:<20} {c['audio']:<44} words {c['contrast_db']:+5.1f} dB over "
+                  f"silence, overrun {c['overrun_s']:+6.2f} s{mark}", flush=True)
+        else:
+            print(f"  {c['session']:<20} {'-':<44} {mark}", flush=True)
+    passing = pd.concat(parts, ignore_index=True)
+    train = (passing.sample(args.train_words, random_state=args.seed)
+             if 0 < args.train_words < len(passing) else passing)
+    y_tr = train["label"].to_numpy()
+    logfreq = np.log(np.bincount(y_tr, minlength=K) + 1.0)
+    print(f"  {len(parts)} sessions pass the alignment check; training on {len(train):,} of their "
+          f"{len(passing):,} word trials", flush=True)
+
+    # Test trials: exactly the saved brain scores' rows (chapter 12, MEG-covered).
+    te = pd.read_csv(OUT / "test_trials.csv")
+    z = np.load(OUT / "test_scores.npz")
+    y, occ = z["y"], te["occ"].to_numpy()
+    by_id = {f"sub-{r.subject}_ses-{r.session}": r
+             for r in find_runs(task="Sherlock1", sessions={"12"}, subjects=BROAD)}
+    feats, test_checks = [], []
+    for rid, g in te.groupby("run_id", sort=False):
+        f, chk = add_acoustics(g, by_id[rid], args.window, cache)
+        test_checks.append(chk)
+        if f is None:
+            raise SystemExit(f"test run {rid} fails the alignment check: {chk}")
+        feats.append(f)
+    te_f = pd.concat(feats).loc[te.index]
+    c12 = test_checks[0]
+    print(f"test: {len(te_f):,} trials, {len(test_checks)} listeners; chapter 12 words "
+          f"{min(c['contrast_db'] for c in test_checks):+.1f} dB over silence or more")
+
+    res = {"window_s": args.window, "n_bins": n_bins, "n_train": len(train),
+           "train_sessions": len(parts), "alignment": checks, "test_alignment": c12, "rungs": {}}
+    logp = {}
+    print(f"\n  {'stimulus-only rung':<44} {'BAcc@1':>7} {'BAcc@10':>8}")
+    print("  " + "-" * 62)
+    print(f"  {'saved timing classifier (all sessions)':<44} {bacc(z['timing'], y)[0]:7.3f} "
+          f"{bacc(z['timing'], y)[1]:8.3f}")
+    names = {"A": "A  timing", "B": "B  + duration, loudness", "C": "C  + broadband envelope",
+             "D": "D  + 8 band envelopes"}
+    for k in RUNGS:
+        clf = TimingClassifier(extra=cols[k]).fit(train, y_tr, n_classes=K)
+        logp[k] = clf.log_proba(te_f)
+        res["rungs"][k] = bacc(logp[k], y)
+        print(f"  {names[k]:<44} {res['rungs'][k][0]:7.3f} {res['rungs'][k][1]:8.3f}", flush=True)
+    d_minus_a = res["rungs"]["D"][1] - res["rungs"]["A"][1]
+    res["acoustics_add"] = bool(d_minus_a >= 0.02)
+    print(f"  D - A: {d_minus_a:+.3f} BAcc@10 -> acoustics {'add' if res['acoustics_add'] else 'do not add'}"
+          " (rule: >= 0.02)")
+
+    groups, _ = matched_setup(te.copy())
+    print(f"\n  timing-matched test on the stimulus-only scores ({args.n_perm} permutations):")
+    for k in ("A", "C", "D"):
+        r = matched_gain(logp[k], y, occ, groups, metric="rank", n_perm=args.n_perm, seed=args.seed)
+        res[f"matched_{k}"] = {"gain": r.gain, "unmatched_gain": r.unmatched_gain,
+                               "surviving": r.surviving, "verdict": r.verdict}
+        print(f"  {names[k]:<28} unmatched {r.unmatched_gain:+.4f}  matched {r.gain:+.4f}  "
+              f"surviving {100 * r.surviving:4.0f}%  [{r.verdict}]", flush=True)
+    res["matched_controls_acoustics"] = not any(
+        res[f"matched_{k}"]["verdict"] == "survives matching" for k in ("C", "D"))
+
+    scores = {k: z[k] for k in ("timing", "linear", "per_person", "mlp", "cnn") if k in z}
+    sweep = OUT / "test_scores_sweep.npz"
+    if sweep.exists():
+        zs = np.load(sweep)
+        scores.update({f"sweep:{k}": zs[k] for k in zs.files if k != "y" and zs[k].shape == z["linear"].shape})
+    old = json.loads((OUT / "matched.json").read_text()) if (OUT / "matched.json").exists() else {}
+    print(f"\n  information beyond the stimulus-only model, nats/word (95% interval):")
+    print(f"  {'scorer':<22} {'beyond D (timing + envelopes)':<40} {'beyond C':<40} "
+          "beyond timing, duration, loudness (section 2.1)")
+    for k, s in scores.items():
+        bd = info_beyond_model(logp["D"], s, y, occ, prior=logfreq, n_boot=args.n_boot, seed=args.seed)
+        bc = info_beyond_model(logp["C"], s, y, occ, prior=logfreq, n_boot=args.n_boot, seed=args.seed)
+        prev = old.get(f"beyond_{k}")
+        prev_s = f"{prev['nats']:+.4f} [{prev['lo']:+.4f}, {prev['hi']:+.4f}]" if prev else "-"
+        res[f"beyond_D_{k}"] = {"nats": bd.nats, "lo": bd.lo, "hi": bd.hi, "dropped": list(bd.dropped)}
+        res[f"beyond_C_{k}"] = {"nats": bc.nats, "lo": bc.lo, "hi": bc.hi}
+        print(f"  {k:<22} {str(bd):<40} {str(bc):<40} {prev_s}", flush=True)
+    print(f"\n  {time.time() - t0:.0f}s")
+    return res
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=("nobrain", "brain", "matched"), default="nobrain")
+    ap.add_argument("--stage", choices=("nobrain", "brain", "matched", "acoustic"), default="nobrain")
     ap.add_argument("--n-perm", type=int, default=200)
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--train-words", type=int, default=60_000,
@@ -392,7 +556,8 @@ def main() -> int:
     if abs(args.window - WINDOW_S) > 1e-9 or args.vocab != "top50":
         OUT = ROOT / "runs" / f"libribrain_audit_w{int(round(args.window * 1000))}_{args.vocab}"
 
-    res = {"nobrain": stage_nobrain, "brain": stage_brain, "matched": stage_matched}[args.stage](args)
+    res = {"nobrain": stage_nobrain, "brain": stage_brain, "matched": stage_matched,
+           "acoustic": stage_acoustic}[args.stage](args)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{args.stage}.json").write_text(json.dumps(res, indent=2, default=float))
     print(f"  saved {OUT.relative_to(ROOT) / (args.stage + '.json')}")

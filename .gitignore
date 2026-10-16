@@ -11,3 +11,5 @@ __pycache__/
 build/
 # pnpl reads credentials (HF_TOKEN, Radboud WebDAV, Kaggle) from a .env file.
 .env
+# Competition entries marked "do not distribute"; read locally, never published.
+/libribrain_winners/

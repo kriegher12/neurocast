@@ -22,6 +22,36 @@ Configuration, as quoted:
   checkpoint carries model, head, optimiser and scheduler state, so a resumed run
   continues the identical sequence of batches and updates.
 
+The two latent-prediction arms of the bake-off (README section 2.6) train here too:
+
+* ``jepa``: masked latent prediction. A bidirectional student sees the window with
+  the same 1-s blocks hidden as the masked arm and predicts, at the hidden
+  positions, an EMA teacher's layer-normed representation of the full window;
+* ``ar_latent``: the same, causal: the student's output at position ``i`` predicts
+  the causal teacher's representation at ``i + 1``.
+
+Both add the sketched isotropic-Gaussian regulariser (``objectives.arms._sigreg``)
+and move the teacher by EMA after every step (``objectives.arms.EMATeacher``). Their
+loss is measured against a moving teacher, so a lower held-out value later in
+training does not mean a better model: their ``.best.pt`` is the latest evaluation,
+and the held-out log also carries the collapse monitor's statistics.
+
+``condition="spectra"`` (forecasting only; README section 2.10) gives the likelihood
+head each recording's spectral profile: per channel, the 1/f exponent and offset,
+log variance and six log band powers (``adapt/nuisance.py``), averaged over 16
+windows of the recording's training span (a held-out session uses its own span),
+standardised over the training recordings, through a linear map that starts at
+zero. Only the head sees it, so the trunk need not carry each person's spectral
+calibration -- the conditioning ContentVec gives its predictor so the
+representation can drop the speaker. Off by default; it changes nothing else.
+
+``calib_guard`` rejects target-calibration windows whose largest absolute value
+exceeds it (session-normalised units; ordinary 4-s windows peak at ~10). A ~1,000x
+artifact in Sherlock1 session 3 leaks ~14 s backwards through the release's
+zero-phase filters, and one calibration window landing in it corrupted a whole
+run's targets (README section 2.5). Off by default; when it rejects nothing the
+draws, and so the run, are exactly those of an unguarded run.
+
 Empty quadrants (LibriBrain's H5 has no EOG/ECG, so the peripheral group is
 empty) are excluded from every likelihood and reconstruction -- see
 :meth:`QuadrantBasis.component_mask`.
@@ -54,7 +84,10 @@ from ..objectives.arms import ar_shift, block_mask
 from .targets import QuadrantBasis
 
 __all__ = ["PretrainConfig", "Recording", "load_recordings", "cache_recordings", "open_cached",
-           "Pretrainer"]
+           "Pretrainer", "LATENT_ARMS"]
+
+#: Arms trained against an EMA teacher's representation rather than the signal.
+LATENT_ARMS = ("jepa", "ar_latent")
 
 #: Serialises reads of memory-mapped sessions across prefetch threads (see ``Recording.window``).
 _DISK_LOCK = threading.Lock()
@@ -97,7 +130,7 @@ def _read_retrying(path, offset: int, size: int, attempts: int = 5, delay: float
 
 @dataclass
 class PretrainConfig:
-    arm: str = "ar_lik"                 # "ar_lik" or "masked"
+    arm: str = "ar_lik"                 # "ar_lik", "masked", "jepa" or "ar_latent"
     rung: str = "6m"
     n_patch: int = 64                   # 4.1 s windows
     batch: int = 8
@@ -117,6 +150,11 @@ class PretrainConfig:
     seed: int = 0
     precision: str = "auto"             # "auto" | "fp32" | "bf16" | "fp16"
     prefetch: int = 0                   # batches drawn ahead on background threads
+    ema_base: float = 0.996             # latent arms: teacher momentum, cosine to ema_final
+    ema_final: float = 0.9999
+    sigreg: float = 0.05                # latent arms: isotropic-Gaussian regulariser weight
+    calib_guard: float = 0.0            # reject calibration windows above this |x| (0: off)
+    condition: str = ""                 # "spectra": the head sees each recording's spectra
 
 
 @dataclass
@@ -260,7 +298,7 @@ class Pretrainer:
         self.recs = recordings
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         torch.manual_seed(cfg.seed)
-        causal = cfg.arm != "masked"
+        causal = cfg.arm not in ("masked", "jepa")
         self.model = NeuroCast(montage, rung=cfg.rung, window=256, causal=causal,
                                device=self.device).to(self.device)
         self.patch = self.model.patch_samples
@@ -275,8 +313,9 @@ class Pretrainer:
             raise ValueError("no recording has a training span of one window")
 
         # Targets: per-region PCA fitted on training windows only.
-        crng = np.random.default_rng(cfg.seed + 7)        # one generator: 64 distinct windows
-        calib = np.stack([self._window(crng, train=True) for _ in range(64)])
+        draws = self.calibration_draws()
+        self.calib_rejected = sum(1 for d in draws if not d[2])
+        calib = np.stack([r.window(st, self.n_times) for r, st, keep in draws if keep])
         self.basis = QuadrantBasis(rank=cfg.rank, patch=self.patch, n_groups=self.G)
         self.basis.fit(calib.astype(np.float32), montage.quadrants)
         self.dim_mask = self.basis.position_mask(cfg.n_patch).to(self.device)   # (N, rank)
@@ -293,10 +332,30 @@ class Pretrainer:
             self.head = torch.nn.Sequential(
                 torch.nn.LayerNorm(d), torch.nn.Linear(d, 2 * d), torch.nn.GELU(),
                 torch.nn.Linear(2 * d, cfg.rank)).to(self.device)
+        elif cfg.arm in LATENT_ARMS:
+            from ..models.heads import LatentPredictionHead
+            from ..objectives.arms import EMATeacher
+
+            d = self.model.d_model
+            self.head = LatentPredictionHead(d, d).to(self.device)
+            self.teacher = EMATeacher(self.model, cfg.ema_base, cfg.ema_final).to(self.device)
         else:
-            raise ValueError(f"arm must be 'ar_lik' or 'masked', got {cfg.arm!r}")
+            raise ValueError(f"arm must be 'ar_lik', 'masked', 'jepa' or 'ar_latent', got {cfg.arm!r}")
+        # Positions with a real target: the empty peripheral group has none.
+        self.valid = self.dim_mask.any(-1)                                      # (N,)
 
         params = list(self.model.parameters()) + list(self.head.parameters())
+        self.cond, self._keys = None, None
+        if cfg.condition:
+            if cfg.condition != "spectra" or cfg.arm != "ar_lik":
+                raise ValueError("condition='spectra' is for the forecasting arm (ar_lik) only")
+            self.cond, self.cond_stats = self._recording_spectra()
+            dim = next(iter(self.cond.values())).numel()
+            self.cond_proj = torch.nn.Linear(dim, self.model.d_model).to(self.device)
+            with torch.no_grad():                      # starts as the plain forecaster
+                self.cond_proj.weight.zero_()
+                self.cond_proj.bias.zero_()
+            params += list(self.cond_proj.parameters())
         self.params = params
         self.opt = torch.optim.AdamW(params, lr=cfg.lr, betas=(0.9, 0.95),
                                      weight_decay=cfg.weight_decay)
@@ -307,12 +366,60 @@ class Pretrainer:
         self.amp_dtype = self._precision()
 
     # -- data -------------------------------------------------------------------------
-    def _window(self, rng: np.random.Generator, train: bool) -> np.ndarray:
+    def _draw(self, rng: np.random.Generator, train: bool) -> tuple[Recording, int]:
         pool = self._pool[train]
         r = pool[int(rng.integers(len(pool)))]
         lo, hi = (0, r.train_stop) if train else (r.train_stop, r.n_samples)
-        start = int(rng.integers(lo, max(hi - self.n_times, lo + 1)))
+        return r, int(rng.integers(lo, max(hi - self.n_times, lo + 1)))
+
+    def _window(self, rng: np.random.Generator, train: bool) -> np.ndarray:
+        r, start = self._draw(rng, train)
         return r.window(start, self.n_times)
+
+    def calibration_draws(self, n: int = 64) -> list[tuple[Recording, int, bool]]:
+        """The target-calibration windows as ``(recording, start, kept)``, in draw order.
+
+        One generator draws until ``n`` windows are kept: 64 distinct windows (a
+        first version re-seeded per draw and calibrated on 64 copies of one).
+        With ``calib_guard`` a window whose largest ``|x|`` exceeds it is drawn,
+        reported and skipped; with the guard off every draw is kept.
+        """
+        rng = np.random.default_rng(self.cfg.seed + 7)
+        out, kept = [], 0
+        while kept < n:
+            r, start = self._draw(rng, train=True)
+            ok = True
+            if self.cfg.calib_guard > 0:
+                peak = float(np.abs(r.window(start, self.n_times).astype(np.float32)).max())
+                ok = peak <= self.cfg.calib_guard
+            out.append((r, start, ok))
+            kept += ok
+            if len(out) > 20 * n:
+                raise ValueError(f"calib_guard {self.cfg.calib_guard}: {len(out) - kept} of "
+                                 f"{len(out)} calibration windows rejected; is the data normalised?")
+        return out
+
+    def _recording_spectra(self, n_windows: int = 16):
+        """Each recording's spectral profile, standardised over the training recordings."""
+        from ..adapt.nuisance import compute
+
+        raw = {}
+        for r in self.recs:
+            hi = r.train_stop if r.train_stop >= self.n_times else r.n_samples
+            starts = np.linspace(0, max(hi - self.n_times, 0), n_windows).astype(int)
+            d = [compute(r.window(int(st), self.n_times).astype(np.float64), 250.0).to_matrix()[:, :-1]
+                 for st in starts]
+            raw[r.key] = np.mean(d, axis=0).ravel()
+        train = np.stack([raw[r.key] for r in self._pool[True]])
+        mu, sd = train.mean(0), train.std(0) + 1e-6
+        cond = {k: torch.as_tensor((v - mu) / sd, dtype=torch.float32, device=self.device)
+                for k, v in raw.items()}
+        return cond, {"mean": mu, "sd": sd}
+
+    def _batch_keys(self, step: int, train: bool) -> list[str]:
+        """The recordings behind batch ``step``: the same draws as ``_batch_np``, no reads."""
+        rng = np.random.default_rng([self.cfg.seed, step, int(train)])
+        return [self._draw(rng, train)[0].key for _ in range(self.cfg.batch)]
 
     def _batch_np(self, step: int, train: bool) -> np.ndarray:
         rng = np.random.default_rng([self.cfg.seed, step, int(train)])
@@ -331,19 +438,55 @@ class Pretrainer:
             return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         return {"bf16": torch.bfloat16, "fp16": torch.float16}[p]
 
+    def _hidden(self, batch: int, n_pos: int, step: int) -> torch.Tensor:
+        """The masked arms' 1-s blocks for ``step``: a pure function of (seed, step)."""
+        g = torch.Generator().manual_seed(self.cfg.seed * 1_000_003 + step)
+        blk = max(1, int(round(self.cfg.mask_block_s * 250.0 / self.patch)) * self.G)
+        return block_mask((batch, n_pos), block_len=blk, target_frac=self.cfg.mask_frac,
+                          generator=g, device=self.device)
+
+    def latent_loss(self, x: torch.Tensor, step: int) -> tuple[torch.Tensor, dict]:
+        """``jepa`` / ``ar_latent``: predict the EMA teacher's layer-normed representation."""
+        from ..objectives.arms import _sigreg
+
+        cfg = self.cfg
+        # The regulariser draws random projections from the global generator; seeding
+        # it here keeps every draw a function of (seed, step), so resume stays exact.
+        torch.manual_seed(cfg.seed * 1_000_003 + step + 17)
+        with torch.no_grad():
+            t = self.teacher(x).float()
+            t = F.layer_norm(t, t.shape[-1:])
+        if cfg.arm == "jepa":
+            hidden = self._hidden(x.shape[0], t.shape[1], step)
+            h = self.model(x, mask=hidden).float()
+            sel = hidden & self.valid[None]
+            pred = self.head(h[sel], t[sel])
+            used = h[:, self.valid]
+        else:
+            h, tt = ar_shift(self.model(x).float(), t)
+            v = self.valid[1:]
+            pred = self.head(h[:, v], tt[:, v])
+            used = h[:, v]
+        reg = _sigreg(used)
+        return pred + cfg.sigreg * reg, {"latent": float(pred.detach()), "sigreg": float(reg.detach())}
+
     def loss(self, x: torch.Tensor, step: int) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
+        if cfg.arm in LATENT_ARMS:
+            return self.latent_loss(x, step)
         tgt = self.basis.encode(x.cpu()).to(self.device)                        # (B, N, r)
         if cfg.arm == "ar_lik":
             h, t = ar_shift(self.model(x), tgt)
+            if self.cond is not None:
+                if self._keys is None or len(self._keys) != x.shape[0]:
+                    raise RuntimeError("a conditioned loss needs the batch's recordings in _keys")
+                c = self.cond_proj(torch.stack([self.cond[k] for k in self._keys]))
+                h = h + c[:, None, :].to(h.dtype)
             m = self.dim_mask[1:].expand_as(t)
             lp = self.head.log_prob(h.float(), t, m)
             nll = -lp.sum() / m.sum()
             return nll, {"nll": float(nll.detach())}
-        g = torch.Generator().manual_seed(cfg.seed * 1_000_003 + step)
-        blk = max(1, int(round(cfg.mask_block_s * 250.0 / self.patch)) * self.G)
-        hidden = block_mask((x.shape[0], tgt.shape[1]), block_len=blk, target_frac=cfg.mask_frac,
-                            generator=g, device=self.device)
+        hidden = self._hidden(x.shape[0], tgt.shape[1], step)
         pred = self.head(self.model(x, mask=hidden)).float()
         real = self.dim_mask.expand_as(tgt)
         err = ((pred - tgt) ** 2) * real
@@ -360,9 +503,12 @@ class Pretrainer:
     def state(self) -> dict:
         return {"cfg": asdict(self.cfg), "step": self.step, "model": self.model.state_dict(),
                 "head": self.head.state_dict(), "opt": self.opt.state_dict(),
+                **({"cond_proj": self.cond_proj.state_dict(), "cond_stats": self.cond_stats}
+                   if self.cond is not None else {}),
                 "sched": self.sched.state_dict(), "log": self.log,
                 "basis": {k: getattr(self.basis, k) for k in
-                          ("rank", "patch", "n_groups", "means", "comps", "scales", "channels", "evr")}}
+                          ("rank", "patch", "n_groups", "means", "comps", "scales", "channels", "evr")},
+                **({"teacher": self.teacher.teacher.state_dict()} if self.cfg.arm in LATENT_ARMS else {})}
 
     def save(self, path: Path, *, weights_only: bool = False) -> None:
         """Atomic checkpoint; ``weights_only`` drops optimiser and scheduler state."""
@@ -382,10 +528,19 @@ class Pretrainer:
         return path.with_name(path.stem + ".best.pt")
 
     def load(self, path: Path) -> None:
-        """Resume from a full checkpoint, or load weights from a ``.best.pt`` one."""
+        """Resume from a full checkpoint, or load weights from a ``.best.pt`` one.
+
+        A weights-only checkpoint of a latent arm may lack the EMA teacher, which
+        only resuming needs (finished runs are slimmed to save disk); a resumable
+        one (with optimiser state) must carry it.
+        """
         s = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(s["model"])
         self.head.load_state_dict(s["head"])
+        if self.cond is not None:
+            self.cond_proj.load_state_dict(s["cond_proj"])
+        if self.cfg.arm in LATENT_ARMS and ("teacher" in s or "opt" in s):
+            self.teacher.teacher.load_state_dict(s["teacher"])
         if "opt" in s:
             self.opt.load_state_dict(s["opt"])
             self.sched.load_state_dict(s["sched"])
@@ -394,6 +549,30 @@ class Pretrainer:
         self.best = min(held) if held else float("inf")
         for k, v in s["basis"].items():
             setattr(self.basis, k, v)
+
+    @property
+    def selects_best(self) -> bool:
+        """Whether ``.best.pt`` is the held-out minimum (False: the latest evaluation)."""
+        return self.cfg.arm not in LATENT_ARMS
+
+    @torch.no_grad()
+    def monitor(self) -> dict:
+        """Collapse statistics of the token representation on held-out windows.
+
+        Tokens, not pooled windows: 32 pooled vectors cap the stable rank at 32 of
+        384 dimensions whatever the model does.
+        """
+        from ..objectives.arms import CollapseMonitor
+
+        self.model.eval()
+        z = []
+        for i in range(4):
+            with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                z.append(self.model(self.batch(30_000_000 + i, train=False))[:, self.valid].float()
+                         .reshape(-1, self.model.d_model))
+        self.model.train()
+        rep = CollapseMonitor().check(torch.cat(z))
+        return {k: float(v) for k, v in rep.items() if k != "abort"}
 
     @torch.no_grad()
     def heldout(self) -> float:
@@ -404,6 +583,7 @@ class Pretrainer:
         vals = []
         for i in range(self.cfg.eval_batches):
             with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                self._keys = self._batch_keys(10_000_000 + i, False) if self.cond is not None else None
                 loss, _ = self.loss(self.batch(10_000_000 + i, train=False), 10_000_000 + i)
             vals.append(float(loss))
         self.model.train()
@@ -441,6 +621,8 @@ class Pretrainer:
     def _fit_loop(self, end, next_batch, scaler, ckpt, verbose, t0, start) -> None:
         while self.step < end:
             x = next_batch(self.step)
+            if self.cond is not None:
+                self._keys = self._batch_keys(self.step, True)
             with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
                 loss, parts = self.loss(x, self.step)
             self.opt.zero_grad(set_to_none=True)
@@ -450,19 +632,23 @@ class Pretrainer:
             scaler.step(self.opt)
             scaler.update()
             self.sched.step()
+            if self.cfg.arm in LATENT_ARMS:
+                self.teacher.update(self.model, self.step, self.cfg.steps)
             self.step += 1
             rec = {"step": self.step, "loss": float(loss.detach()), **parts,
                    "lr": self.sched.get_last_lr()[0]}
             if self.step % self.cfg.eval_every == 0 or self.step == end:
                 rec["heldout"] = self.heldout()
+                if self.cfg.arm in LATENT_ARMS and self._pool[False]:
+                    rec["monitor"] = self.monitor()
                 if verbose:
                     print(f"  {self.cfg.arm:<7} step {self.step:5d}  loss {rec['loss']:+.4f}  "
                           f"held-out {rec['heldout']:+.4f}  lr {rec['lr']:.2e}  "
                           f"{(time.time() - t0) / max(self.step - start, 1):.2f} s/step", flush=True)
                 if ckpt is not None:
                     self.log.append(rec)
-                    if rec["heldout"] < self.best:
-                        self.best = rec["heldout"]
+                    if rec["heldout"] < self.best or not self.selects_best:
+                        self.best = min(self.best, rec["heldout"])
                         self.save(self.best_path(ckpt), weights_only=True)
                     self.save(ckpt)
                     continue

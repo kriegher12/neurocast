@@ -335,7 +335,11 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=20_000)
     ap.add_argument("--per-listener", type=int, default=64)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--out", type=Path, help="run directory (default runs/pretrain_scale)")
     args = ap.parse_args()
+    global OUT
+    if args.out:
+        OUT = args.out.resolve()
     OUT.mkdir(parents=True, exist_ok=True)
     if args.prepare:
         return cmd_prepare(args)

@@ -36,12 +36,18 @@ class TimingClassifier:
     Each feature contributes a one-hot of ``n_bins`` quantile bins (edges fitted
     on training data), its standardised raw value, and an "absent" flag -- a next
     word that starts after the window ends is *absent*, not zero.
+
+    ``extra`` names further columns that enter standardised and as they are (the
+    stimulus-only rungs of README section 2.4: duration, loudness, envelope bins).
     """
 
-    def __init__(self, n_bins: int = 12, C: float = 1.0, max_iter: int = 3000) -> None:
+    def __init__(self, n_bins: int = 12, C: float = 1.0, max_iter: int = 3000,
+                 extra: tuple[str, ...] = ()) -> None:
         self.n_bins, self.C, self.max_iter = n_bins, C, max_iter
+        self.extra = tuple(extra)
         self.edges: dict[str, np.ndarray] = {}
         self.moments: dict[str, tuple[float, float]] = {}
+        self.extra_moments: tuple[np.ndarray, np.ndarray] | None = None
         self.model = None
         self.n_classes = 0
 
@@ -57,6 +63,9 @@ class TimingClassifier:
             onehot = np.zeros((len(v), len(self.edges[c]) + 1))
             onehot[np.arange(len(v))[present], b[present]] = 1.0
             cols.append(onehot)
+        if self.extra:
+            mu, sd = self.extra_moments
+            cols.append((np.nan_to_num(df[list(self.extra)].to_numpy(dtype=float)) - mu) / sd)
         return np.hstack(cols)
 
     def fit(self, df, y: np.ndarray, n_classes: int) -> "TimingClassifier":
@@ -69,6 +78,9 @@ class TimingClassifier:
             self.edges[c] = np.unique(qs)
             self.moments[c] = (float(v.mean()) if v.size else 0.0,
                                float(v.std()) + 1e-9 if v.size else 1.0)
+        if self.extra:
+            x = np.nan_to_num(df[list(self.extra)].to_numpy(dtype=float))
+            self.extra_moments = (x.mean(0), x.std(0) + 1e-9)
         self.n_classes = n_classes
         self.model = LogisticRegression(C=self.C, class_weight="balanced",
                                         max_iter=self.max_iter)
